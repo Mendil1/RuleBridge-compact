@@ -22,46 +22,53 @@ import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-
-import java.util.stream.Collectors;
-import java.util.Map;
 
 /**
  * Everything that isn't "config" or "CLI menu" lives here:
  *  - BGE-M3 embeddings (DJL / ONNX)
  *  - Excel parsing (Apache POI)
- *  - Chroma REST client (OkHttp + Jackson)   <-- see NOTE below
- *  - Gemini calls + prompt building (RAG)
- *  - Human-feedback learning (approved / rejected examples)
- *
- * NOTE ON CHROMA: this uses the plain v1 REST API
- * (POST /api/v1/collections, /api/v1/collections/{id}/upsert, /query).
- * If your existing VectorStoreService talked to a different Chroma version
- * (v2 API with tenant/database), swap the three chromaXxx() methods below
- * for your already-working implementation and keep the rest unchanged.
+ *  - Chroma REST client (OkHttp + Jackson, v2 tenant/database API) with retry/backoff
+ *  - Gemini calls + prompt building (RAG) with retry/backoff
+ *  - Human-feedback learning (approved / rejected examples), viewable and deletable by id
+ *  - Incremental ingestion (skips unchanged Excel rows via a content hash stored in Chroma)
+ *  - Explaining a generated rule / answering follow-up questions about it
+ *  - Startup validation + persistent logging (~/.rulebridge/rulebridge.log)
  */
 public class Engine implements AutoCloseable {
 
     private static final int EMBEDDING_DIMENSION = 1024;
     private static final int MAX_SEQUENCE_LENGTH = 512;
     private static final String SHEET_NAME = "Master_4679_Rules";
+    private static final Path LOG_FILE = Paths.get(System.getProperty("user.home"), ".rulebridge", "rulebridge.log");
 
     private final Config config;
     private final ObjectMapper mapper = new ObjectMapper();
-    private final OkHttpClient http;
+
+    // Separate clients so a slow Gemini call can't starve Chroma's fail-fast behaviour and vice versa.
+    private final OkHttpClient httpChroma;
+    private final OkHttpClient httpGemini;
+
     private final Map<String, String> collectionIds = new HashMap<>();
 
     private final HuggingFaceTokenizer tokenizer;
     private final Predictor<String, float[]> predictor;
 
     public Engine(Config config) throws IOException, MalformedModelException {
+        validateStartupFiles(config);
+
         this.config = config;
+        log("Engine starting for user '" + config.getUserId() + "'.");
         log("Loading embedding model from " + config.getModelPath() + " ...");
         this.tokenizer = HuggingFaceTokenizer.newInstance(Paths.get(config.getModelPath()));
         Model model = Model.newInstance("bge-m3");
@@ -69,15 +76,62 @@ public class Engine implements AutoCloseable {
         this.predictor = model.newPredictor(new BGEM3Translator(tokenizer, MAX_SEQUENCE_LENGTH));
         log("Embedding model ready.");
 
-        this.http = new OkHttpClient.Builder()
-                .connectTimeout(30, TimeUnit.SECONDS)
-                .writeTimeout(30, TimeUnit.SECONDS)
-                .readTimeout(60, TimeUnit.SECONDS)
+        this.httpChroma = new OkHttpClient.Builder()
+                .connectTimeout(config.getChromaConnectTimeoutSec(), TimeUnit.SECONDS)
+                .writeTimeout(config.getChromaReadTimeoutSec(), TimeUnit.SECONDS)
+                .readTimeout(config.getChromaReadTimeoutSec(), TimeUnit.SECONDS)
+                .build();
+
+        this.httpGemini = new OkHttpClient.Builder()
+                .connectTimeout(config.getGeminiConnectTimeoutSec(), TimeUnit.SECONDS)
+                .writeTimeout(config.getGeminiReadTimeoutSec(), TimeUnit.SECONDS)
+                .readTimeout(config.getGeminiReadTimeoutSec(), TimeUnit.SECONDS)
                 .build();
     }
 
+    /** Fails fast with a clear message if the model files or Excel file are missing/incomplete. */
+    private static void validateStartupFiles(Config config) {
+        Path modelDir = Paths.get(config.getModelPath());
+        if (!Files.isDirectory(modelDir)) {
+            throw new IllegalStateException("Model directory not found: " + modelDir +
+                    " - check model.path in rulebridge.properties.");
+        }
+        Path onnx = modelDir.resolve("model.onnx");
+        if (!Files.isRegularFile(onnx)) {
+            throw new IllegalStateException("model.onnx not found in " + modelDir +
+                    " - the embedding model directory looks incomplete.");
+        }
+        Path excel = Paths.get(config.getExcelFilePath());
+        if (!Files.isRegularFile(excel)) {
+            throw new IllegalStateException("Excel file not found: " + excel +
+                    " - check excel.file-path in rulebridge.properties.");
+        }
+    }
+
+    // ======================================================================
+    // Logging: prints to console AND appends a timestamped line to
+    // ~/.rulebridge/rulebridge.log. Also used to record every user request
+    // (prompt / feedback / question) and the corresponding AI response, so
+    // the log file doubles as a full interaction transcript. Never throws -
+    // a logging failure must never crash the app.
+    // ======================================================================
     private static void log(String msg) {
-        System.out.println("[RuleBridge] " + msg);
+        String line = "[RuleBridge] " + msg;
+        System.out.println(line);
+        appendToLogFile(line);
+    }
+
+    private static void appendToLogFile(String line) {
+        try {
+            Files.createDirectories(LOG_FILE.getParent());
+            try (BufferedWriter w = Files.newBufferedWriter(LOG_FILE, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+                w.write(LocalDateTime.now() + " " + line);
+                w.newLine();
+            }
+        } catch (IOException e) {
+            // Swallow on purpose: logging must never crash the app.
+        }
     }
 
     private static String n(String s) { return s == null ? "" : s; }
@@ -97,6 +151,26 @@ public class Engine implements AutoCloseable {
                 "Catégorie: " + n(r.categorieRegle) + "\n" +
                 "Champ UI: " + n(r.nomChamp) + " (" + n(r.libelleChamp) + ")\n" +
                 "Description Métier: " + n(r.descriptionErreur);
+    }
+
+    /** Content fingerprint used for incremental ingestion (see fetchExistingHashes / ingest). */
+    private String computeContentHash(Rule r) {
+        String basis = n(r.categorieRegle) + "|" + n(r.nomChamp) + "|" + n(r.libelleChamp) + "|" +
+                n(r.descriptionErreur) + "|" + n(r.expressionJava);
+        return sha256Hex(basis);
+    }
+
+    private String sha256Hex(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is guaranteed available on every JVM; this can't actually happen.
+            throw new IllegalStateException(e);
+        }
     }
 
     // ======================================================================
@@ -174,7 +248,7 @@ public class Engine implements AutoCloseable {
     }
 
     // ======================================================================
-    // Ingestion: Excel -> embeddings -> Chroma
+    // Ingestion: Excel -> embeddings -> Chroma (incremental, fault-tolerant)
     // ======================================================================
     public void ingest() throws Exception {
         log("Reading Excel: " + config.getExcelFilePath());
@@ -183,12 +257,41 @@ public class Engine implements AutoCloseable {
             log("No rules found - aborting ingestion.");
             return;
         }
-        log("Loaded " + rules.size() + " rules. Embedding & indexing...");
+        log("Parsed " + rules.size() + " rules from Excel. Checking against ChromaDB for changes...");
+
+        Map<String, String> existingHashes = fetchExistingHashes(config.getChromaCollection());
+        log("ChromaDB currently holds " + existingHashes.size() + " previously-indexed Excel rule(s).");
+
+        List<Rule> toProcess = new ArrayList<>();
+        Set<String> currentIds = new HashSet<>();
+        for (Rule r : rules) {
+            String id = "rule_" + r.expressionPk;
+            currentIds.add(id);
+            String hash = computeContentHash(r);
+            if (!hash.equals(existingHashes.get(id))) {
+                toProcess.add(r);
+            }
+        }
+
+        int unchanged = rules.size() - toProcess.size();
+        log(unchanged + " rule(s) unchanged - skipped (no re-embedding). " +
+                toProcess.size() + " rule(s) are new or modified and will be embedded.");
+
+        recordStaleRuleIds(existingHashes.keySet(), currentIds);
+
+        if (toProcess.isEmpty()) {
+            log("Nothing to embed - ChromaDB is already up to date with the Excel file.");
+            return;
+        }
 
         int batchSize = config.getEmbeddingBatchSize();
-        for (int i = 0; i < rules.size(); i += batchSize) {
-            int end = Math.min(i + batchSize, rules.size());
-            List<Rule> batch = rules.subList(i, end);
+        int totalBatches = (toProcess.size() + batchSize - 1) / batchSize;
+        int failedBatches = 0;
+
+        for (int i = 0; i < toProcess.size(); i += batchSize) {
+            int end = Math.min(i + batchSize, toProcess.size());
+            List<Rule> batch = toProcess.subList(i, end);
+            int batchNum = i / batchSize + 1;
 
             List<String> ids = new ArrayList<>();
             List<String> docs = new ArrayList<>();
@@ -207,18 +310,89 @@ public class Engine implements AutoCloseable {
                 meta.put("libelle_champ", n(r.libelleChamp));
                 meta.put("expression_java", n(r.expressionJava));
                 meta.put("source", "excel");
+                meta.put("content_hash", computeContentHash(r));
                 metas.add(meta);
             }
-            chromaUpsert(config.getChromaCollection(), ids, embeddings, docs, metas);
-            log("Indexed rows " + i + "-" + (end - 1));
+
+            try {
+                chromaUpsert(config.getChromaCollection(), ids, embeddings, docs, metas);
+                log("Batch " + batchNum + "/" + totalBatches + " indexed (rows " + i + "-" + (end - 1) + ").");
+            } catch (IOException e) {
+                failedBatches++;
+                log("Batch " + batchNum + "/" + totalBatches + " FAILED after retries: " + e.getMessage() +
+                        " - continuing with the next batch. Simply re-run ingestion later: unchanged rows " +
+                        "are skipped automatically, so only the rows that never made it in will be retried.");
+            }
         }
-        log("Ingestion complete: " + rules.size() + " rules indexed.");
+
+        if (failedBatches == 0) {
+            log("Ingestion complete: " + toProcess.size() + " rule(s) embedded/updated, " + unchanged + " unchanged.");
+        } else {
+            log("Ingestion finished with " + failedBatches + "/" + totalBatches + " batch(es) failed - re-run to retry them.");
+        }
+    }
+
+    /** Reads existing content_hash metadata for every Excel-sourced row currently in Chroma. */
+    private Map<String, String> fetchExistingHashes(String collectionName) throws IOException {
+        Map<String, String> hashes = new HashMap<>();
+        int limit = 300;
+        int offset = 0;
+        while (true) {
+            List<Map<String, Object>> items = chromaGet(collectionName,
+                    Collections.singletonMap("source", "excel"), limit, offset);
+            if (items.isEmpty()) break;
+            for (Map<String, Object> item : items) {
+                Object id = item.get("id");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> meta = (Map<String, Object>) item.get("metadata");
+                if (id != null && meta != null && meta.get("content_hash") != null) {
+                    hashes.put(String.valueOf(id), String.valueOf(meta.get("content_hash")));
+                }
+            }
+            if (items.size() < limit) break;
+            offset += limit;
+        }
+        return hashes;
+    }
+
+    /** Rows that exist in Chroma but no longer appear in the Excel file: flagged, never auto-deleted. */
+    private void recordStaleRuleIds(Set<String> existingIds, Set<String> currentIds) throws IOException {
+        List<String> stale = new ArrayList<>();
+        for (String id : existingIds) {
+            if (!currentIds.contains(id)) stale.add(id);
+        }
+        Path staleFile = Paths.get(System.getProperty("user.home"), ".rulebridge", "stale_rule_ids.txt");
+        if (stale.isEmpty()) {
+            Files.deleteIfExists(staleFile);
+            return;
+        }
+        log(stale.size() + " previously-indexed rule(s) no longer appear in the Excel file. " +
+                "They were NOT deleted automatically - use the cleanup menu option if you want to remove them.");
+        Files.createDirectories(staleFile.getParent());
+        Files.write(staleFile, stale, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+    }
+
+    /** For the CLI's cleanup menu: rule ids flagged by the last ingestion as no longer in Excel. */
+    public List<String> getStaleRuleIds() throws IOException {
+        Path staleFile = Paths.get(System.getProperty("user.home"), ".rulebridge", "stale_rule_ids.txt");
+        if (!Files.exists(staleFile)) return Collections.emptyList();
+        List<String> lines = Files.readAllLines(staleFile);
+        List<String> ids = new ArrayList<>();
+        for (String l : lines) if (!l.trim().isEmpty()) ids.add(l.trim());
+        return ids;
+    }
+
+    /** Deletes the given rule ids from Chroma after the user has explicitly confirmed. */
+    public void deleteRules(List<String> ids) throws IOException {
+        chromaDelete(config.getChromaCollection(), ids);
+        Files.deleteIfExists(Paths.get(System.getProperty("user.home"), ".rulebridge", "stale_rule_ids.txt"));
     }
 
     // ======================================================================
     // RAG generation
     // ======================================================================
     public GenerationResult generate(String userPrompt, int topK) throws Exception {
+        log("REQUEST (generate) user='" + config.getUserId() + "' prompt=\"" + userPrompt + "\"");
         long t0 = System.currentTimeMillis();
         QueryResult similar = retrieveSimilar(config.getChromaCollection(), userPrompt, topK, config.isDeduplicate());
         QueryResult rejected = retrieveSimilar(config.getRejectedCollection(), userPrompt, 1, false);
@@ -228,11 +402,13 @@ public class Engine implements AutoCloseable {
         String code = callGemini(system, fewShot);
 
         double latency = (System.currentTimeMillis() - t0) / 1000.0;
-        return new GenerationResult(userPrompt, code, similar.metadatas, system, fewShot, latency);
+        log("RESPONSE (generate): " + code);
+        return new GenerationResult(userPrompt, code, similar.metadatas, rejected.metadatas, system, fewShot, latency);
     }
 
-    /** Conversational revision: "add a null check", "change date format", etc. */
+    /** Conversational revision: "add a null check", "change date format", etc. Produces new DSL code. */
     public GenerationResult revise(GenerationResult previous, String userFeedback) throws Exception {
+        log("REQUEST (revise) user='" + config.getUserId() + "' feedback=\"" + userFeedback + "\"");
         long t0 = System.currentTimeMillis();
         String system = buildSystemInstruction();
         StringBuilder sb = new StringBuilder();
@@ -244,7 +420,58 @@ public class Engine implements AutoCloseable {
         String fewShot = sb.toString();
         String code = callGemini(system, fewShot);
         double latency = (System.currentTimeMillis() - t0) / 1000.0;
-        return new GenerationResult(previous.userPrompt, code, previous.retrievedContext, system, fewShot, latency);
+        log("RESPONSE (revise): " + code);
+        return new GenerationResult(previous.userPrompt, code, previous.retrievedContext,
+                previous.retrievedRejected, system, fewShot, latency);
+    }
+
+    /**
+     * Conversational Q&A about an *already generated* rule: "why did you write it this way",
+     * "why did you use ColUtil:eval here", etc. Does NOT regenerate DSL code - it explains.
+     * qaHistory accumulates (question, answer) pairs for this generation session so follow-up
+     * questions keep context; pass an empty list for the first question.
+     */
+    public String askAboutGeneration(GenerationResult result, List<String[]> qaHistory, String question) throws IOException {
+        log("REQUEST (question) user='" + config.getUserId() + "' question=\"" + question + "\"");
+        String system = "Vous êtes un expert développeur Java Senior chez BFI Group qui EXPLIQUE, en français, " +
+                "les choix faits lors de la génération d'une expression Java/DSL de validation. " +
+                "Vous NE générez PAS de nouvelle expression sauf si l'utilisateur le demande explicitement. " +
+                "Appuyez-vous sur l'exigence métier, les exemples de référence utilisés et l'expression générée " +
+                "ci-dessous pour justifier vos choix (syntaxe BFI, gestion des nulls, BigDecimal, dates, etc.). " +
+                "Répondez de façon claire, concise et pédagogique.";
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("### EXIGENCE MÉTIER ORIGINALE :\n").append(result.userPrompt).append("\n\n");
+        sb.append("### EXPRESSION GÉNÉRÉE :\n").append(result.generatedCode).append("\n\n");
+
+        if (result.retrievedContext != null && !result.retrievedContext.isEmpty()) {
+            sb.append("### EXEMPLES DE RÉFÉRENCE UTILISÉS POUR CETTE GÉNÉRATION :\n");
+            for (Map<String, Object> meta : result.retrievedContext) {
+                sb.append("- Code Règle: ").append(meta.getOrDefault("code_regle", "N/A"))
+                        .append(" | Expression: ").append(meta.getOrDefault("expression_java", "N/A")).append("\n");
+            }
+            sb.append("\n");
+        }
+        if (result.retrievedRejected != null && !result.retrievedRejected.isEmpty()) {
+            sb.append("### CONTRE-EXEMPLE PRIS EN COMPTE (rejeté précédemment) :\n");
+            Map<String, Object> meta = result.retrievedRejected.get(0);
+            sb.append("- Expression rejetée: ").append(meta.getOrDefault("expression_java", "N/A"))
+                    .append(" | Raison: ").append(meta.getOrDefault("reason", "non précisée")).append("\n\n");
+        }
+
+        if (qaHistory != null && !qaHistory.isEmpty()) {
+            sb.append("### ÉCHANGE PRÉCÉDENT DANS CETTE SESSION :\n");
+            for (String[] qa : qaHistory) {
+                sb.append("Q: ").append(qa[0]).append("\nR: ").append(qa[1]).append("\n\n");
+            }
+        }
+
+        sb.append("### QUESTION DE L'UTILISATEUR :\n").append(question).append("\n\n")
+                .append("Répondez uniquement à cette question, en français, sans régénérer l'expression.");
+
+        String answer = callGemini(system, sb.toString());
+        log("RESPONSE (answer): " + answer);
+        return answer;
     }
 
     // ======================================================================
@@ -256,7 +483,10 @@ public class Engine implements AutoCloseable {
         String id = "human_" + UUID.randomUUID();
         float[] emb = embed(prompt);
         Map<String, Object> meta = new LinkedHashMap<>();
-        meta.put("code_regle", "HUMAN_APPROVED");
+        // IMPORTANT: code_regle must be unique per approved example. dedupe() keeps only the
+        // FIRST result per code_regle value, so a shared constant here would silently discard
+        // every approved example after the first one retrieved for a given query.
+        meta.put("code_regle", id);
         meta.put("category", "human_feedback");
         meta.put("nom_champ", "");
         meta.put("libelle_champ", "");
@@ -267,10 +497,8 @@ public class Engine implements AutoCloseable {
                 Collections.singletonList(emb),
                 Collections.singletonList(prompt),
                 Collections.singletonList(meta));
-        log("Saved approved example for future few-shot retrieval.");
+        log("Saved approved example (id=" + id + ") for future few-shot retrieval.");
     }
-
-
 
     /** Rejected code: kept as a counter-example (in Chroma) + local audit log, never used as a positive few-shot. */
     public void learnFromRejection(String prompt, String rejectedCode, String reason) throws Exception {
@@ -289,6 +517,7 @@ public class Engine implements AutoCloseable {
         Path logFile = Paths.get(System.getProperty("user.home"), ".rulebridge", "rejected_examples.jsonl");
         Files.createDirectories(logFile.getParent());
         Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("id", id); // lets us find and remove this exact line later (see removeRejectedLogLine)
         entry.put("prompt", prompt);
         entry.put("rejected_code", rejectedCode);
         entry.put("reason", reason);
@@ -297,48 +526,49 @@ public class Engine implements AutoCloseable {
             w.write(mapper.writeValueAsString(entry));
             w.newLine();
         }
-        log("Saved rejected example (will be shown to the AI as a counter-example next time).");
+        log("Saved rejected example (id=" + id + ", will be shown to the AI as a counter-example next time).");
     }
 
     // ======================================================================
-// Viewing approved / rejected pairs
-// ======================================================================
+    // Viewing / deleting approved / rejected pairs
+    // ======================================================================
 
     public static class Pair {
+        public final String id;
         public final String prompt;
         public final String code;
         public final String reason;
 
-        public Pair(String prompt, String code, String reason) {
+        public Pair(String id, String prompt, String code, String reason) {
+            this.id = id;
             this.prompt = prompt != null ? prompt : "";
             this.code = code != null ? code : "";
             this.reason = reason != null ? reason : "";
         }
     }
 
-    /**
-     * Returns all human‑approved prompt→code pairs stored in the main Chroma collection.
-     */
+    /** Returns all human-approved prompt->code pairs stored in the main Chroma collection. */
     public List<Pair> getApprovedPairs() throws IOException {
         Map<String, Object> filter = Collections.singletonMap("source", "human_approved");
-        List<Map<String, Object>> items = chromaGet(config.getChromaCollection(), filter, 200);
+        List<Map<String, Object>> items = chromaGet(config.getChromaCollection(), filter, 200, 0);
         List<Pair> pairs = new ArrayList<>();
         for (Map<String, Object> item : items) {
+            String id = item.get("id") != null ? String.valueOf(item.get("id")) : null;
             String prompt = (String) item.get("document");
+            @SuppressWarnings("unchecked")
             Map<String, Object> meta = (Map<String, Object>) item.get("metadata");
 
             String code = "";
             if (meta != null && meta.get("expression_java") != null) {
                 code = String.valueOf(meta.get("expression_java"));
             }
-
-            pairs.add(new Pair(prompt, code, null));
+            pairs.add(new Pair(id, prompt, code, null));
         }
         return pairs;
     }
 
     /**
-     * Returns all rejected prompt→code pairs from the local JSONL audit log,
+     * Returns all rejected prompt->code pairs from the local JSONL audit log,
      * falling back to Chroma's rejected collection if needed.
      */
     public List<Pair> getRejectedPairs() {
@@ -349,14 +579,13 @@ public class Engine implements AutoCloseable {
             try {
                 List<String> lines = Files.readAllLines(logFile);
                 for (String line : lines) {
-                    if (line.trim().isEmpty()) continue; // Fix: ignore trailing/empty lines
-
+                    if (line.trim().isEmpty()) continue;
                     Map<String, Object> entry = mapper.readValue(line, new TypeReference<Map<String, Object>>() {});
+                    String id = entry.get("id") != null ? String.valueOf(entry.get("id")) : null;
                     String prompt = (String) entry.get("prompt");
                     String code = (String) entry.get("rejected_code");
                     String reason = (String) entry.get("reason");
-
-                    pairs.add(new Pair(prompt, code, reason));
+                    pairs.add(new Pair(id, prompt, code, reason));
                 }
                 return pairs;
             } catch (IOException e) {
@@ -364,19 +593,19 @@ public class Engine implements AutoCloseable {
             }
         }
 
-        // Fallback: query Chroma rejected collection
         try {
-            List<Map<String, Object>> items = chromaGet(config.getRejectedCollection(), Collections.emptyMap(), 500);
+            List<Map<String, Object>> items = chromaGet(config.getRejectedCollection(), Collections.emptyMap(), 500, 0);
             for (Map<String, Object> item : items) {
+                String id = item.get("id") != null ? String.valueOf(item.get("id")) : null;
                 String prompt = (String) item.get("document");
+                @SuppressWarnings("unchecked")
                 Map<String, Object> meta = (Map<String, Object>) item.get("metadata");
 
                 String code = "";
                 if (meta != null && meta.get("expression_java") != null) {
                     code = String.valueOf(meta.get("expression_java"));
                 }
-
-                pairs.add(new Pair(prompt, code, ""));
+                pairs.add(new Pair(id, prompt, code, ""));
             }
         } catch (IOException e) {
             log("Could not retrieve rejected pairs from Chroma: " + e.getMessage());
@@ -384,44 +613,43 @@ public class Engine implements AutoCloseable {
         return pairs;
     }
 
-    /**
-     * Low‑level call to ChromaDB’s /get endpoint.
-     */
-    @SuppressWarnings("unchecked")
-    private List<Map<String, Object>> chromaGet(String collectionName, Map<String, Object> whereFilter, int limit) throws IOException {
-        String id = collectionId(collectionName);
-        String url = collectionsBaseUrl() + "/" + id + "/get";
-
-        Map<String, Object> body = new LinkedHashMap<>();
-        if (!whereFilter.isEmpty()) body.put("where", whereFilter);
-        body.put("limit", limit);
-        body.put("include", Arrays.asList("documents", "metadatas"));
-
-        Request req = new Request.Builder()
-                .url(url)
-                .post(RequestBody.create(mapper.writeValueAsString(body), MediaType.get("application/json")))
-                .build();
-
-        try (Response resp = http.newCall(req).execute()) {
-            if (!resp.isSuccessful() || resp.body() == null) {
-                throw new IOException("Chroma get failed: " + resp.code());
-            }
-
-            Map<String, Object> m = mapper.readValue(resp.body().string(), new TypeReference<Map<String, Object>>() {});
-
-            // Fix: Null-safe extraction for documents and metadatas lists
-            List<String> docs = m.get("documents") instanceof List ? (List<String>) m.get("documents") : Collections.emptyList();
-            List<Map<String, Object>> metas = m.get("metadatas") instanceof List ? (List<Map<String, Object>>) m.get("metadatas") : Collections.emptyList();
-
-            List<Map<String, Object>> items = new ArrayList<>();
-            for (int i = 0; i < docs.size(); i++) {
-                Map<String, Object> item = new LinkedHashMap<>();
-                item.put("document", docs.get(i));
-                item.put("metadata", i < metas.size() ? metas.get(i) : Collections.emptyMap());
-                items.add(item);
-            }
-            return items;
+    /** Deletes one approved pair from Chroma by its id. */
+    public void deleteApprovedPair(String id) throws IOException {
+        if (id == null) {
+            throw new IOException("This pair has no id (older entry) and cannot be deleted this way.");
         }
+        chromaDelete(config.getChromaCollection(), Collections.singletonList(id));
+        log("Deleted approved pair (id=" + id + ").");
+    }
+
+    /** Deletes one rejected pair from Chroma AND removes its matching line from the local JSONL log. */
+    public void deleteRejectedPair(String id) throws IOException {
+        if (id == null) {
+            throw new IOException("This pair has no id (older entry) and cannot be deleted this way.");
+        }
+        chromaDelete(config.getRejectedCollection(), Collections.singletonList(id));
+        removeRejectedLogLine(id);
+        log("Deleted rejected pair (id=" + id + ").");
+    }
+
+    private void removeRejectedLogLine(String id) throws IOException {
+        Path logFile = Paths.get(System.getProperty("user.home"), ".rulebridge", "rejected_examples.jsonl");
+        if (!Files.exists(logFile)) return;
+
+        List<String> lines = Files.readAllLines(logFile);
+        List<String> kept = new ArrayList<>();
+        for (String line : lines) {
+            if (line.trim().isEmpty()) continue;
+            boolean matches = false;
+            try {
+                Map<String, Object> entry = mapper.readValue(line, new TypeReference<Map<String, Object>>() {});
+                matches = id.equals(String.valueOf(entry.get("id")));
+            } catch (IOException ignored) {
+                // Malformed line: keep it rather than risk losing data.
+            }
+            if (!matches) kept.add(line);
+        }
+        Files.write(logFile, kept, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
     // ======================================================================
@@ -526,30 +754,33 @@ public class Engine implements AutoCloseable {
         requestMap.put("generationConfig", genConfig);
 
         String jsonBody = mapper.writeValueAsString(requestMap);
-        Request request = new Request.Builder()
-                .url(url)
-                .addHeader("X-goog-api-key", apiKey.trim())
-                .post(RequestBody.create(jsonBody, MediaType.get("application/json; charset=utf-8")))
-                .build();
 
-        try (Response response = http.newCall(request).execute()) {
-            String body = response.body() != null ? response.body().string() : "";
-            if (!response.isSuccessful()) {
-                throw new IOException("Gemini API error: " + response.code() + " - " + body);
-            }
-            Map<String, Object> resp = mapper.readValue(body, new TypeReference<Map<String, Object>>() {});
-            List<Map<String, Object>> candidates = (List<Map<String, Object>>) resp.get("candidates");
-            if (candidates != null && !candidates.isEmpty()) {
-                Map<String, Object> content = (Map<String, Object>) candidates.get(0).get("content");
-                if (content != null) {
-                    List<Map<String, Object>> parts = (List<Map<String, Object>>) content.get("parts");
-                    if (parts != null && !parts.isEmpty()) {
-                        return cleanFences((String) parts.get(0).get("text"));
+        return withRetry("Gemini generateContent", () -> {
+            Request request = new Request.Builder()
+                    .url(url)
+                    .addHeader("X-goog-api-key", apiKey.trim())
+                    .post(RequestBody.create(jsonBody, MediaType.get("application/json; charset=utf-8")))
+                    .build();
+
+            try (Response response = httpGemini.newCall(request).execute()) {
+                String body = response.body() != null ? response.body().string() : "";
+                if (!response.isSuccessful()) {
+                    throw new HttpStatusException(response.code(), "Gemini API error: " + response.code() + " - " + body);
+                }
+                Map<String, Object> resp = mapper.readValue(body, new TypeReference<Map<String, Object>>() {});
+                List<Map<String, Object>> candidates = (List<Map<String, Object>>) resp.get("candidates");
+                if (candidates != null && !candidates.isEmpty()) {
+                    Map<String, Object> content = (Map<String, Object>) candidates.get(0).get("content");
+                    if (content != null) {
+                        List<Map<String, Object>> parts = (List<Map<String, Object>>) content.get("parts");
+                        if (parts != null && !parts.isEmpty()) {
+                            return cleanFences((String) parts.get(0).get("text"));
+                        }
                     }
                 }
+                return "// No output generated";
             }
-            return "// No output generated";
-        }
+        });
     }
 
     private String cleanFences(String text) {
@@ -577,43 +808,51 @@ public class Engine implements AutoCloseable {
         if (collectionIds.containsKey(name)) return collectionIds.get(name);
         String url = collectionsBaseUrl();
 
-        // 1. List existing collections and look for a name match.
-        Request list = new Request.Builder().url(url).get().build();
-        try (Response resp = http.newCall(list).execute()) {
-            if (resp.isSuccessful() && resp.body() != null) {
+        String found = withRetry("Chroma list collections", () -> {
+            Request list = new Request.Builder().url(url).get().build();
+            try (Response resp = httpChroma.newCall(list).execute()) {
+                if (!resp.isSuccessful()) {
+                    throw new HttpStatusException(resp.code(), "Could not list Chroma collections: " + resp.code() +
+                            " " + (resp.body() != null ? resp.body().string() : "") +
+                            " (check chroma.tenant / chroma.database in rulebridge.properties)");
+                }
+                if (resp.body() == null) return null;
                 List<Map<String, Object>> collections =
                         mapper.readValue(resp.body().string(), new TypeReference<List<Map<String, Object>>>() {});
                 for (Map<String, Object> c : collections) {
                     if (name.equals(c.get("name"))) {
-                        String id = String.valueOf(c.get("id"));
-                        collectionIds.put(name, id);
-                        return id;
+                        return String.valueOf(c.get("id"));
                     }
                 }
-            } else if (!resp.isSuccessful()) {
-                throw new IOException("Could not list Chroma collections: " + resp.code() +
-                        " " + (resp.body() != null ? resp.body().string() : "") +
-                        " (check chroma.tenant / chroma.database in rulebridge.properties)");
+                return null;
             }
+        });
+
+        if (found != null) {
+            collectionIds.put(name, found);
+            return found;
         }
 
-        // 2. Not found -> create it.
         Map<String, Object> createBody = new LinkedHashMap<>();
         createBody.put("name", name);
-        Request post = new Request.Builder()
-                .url(url)
-                .post(RequestBody.create(mapper.writeValueAsString(createBody), MediaType.get("application/json")))
-                .build();
-        try (Response resp = http.newCall(post).execute()) {
-            if (!resp.isSuccessful() || resp.body() == null) {
-                throw new IOException("Could not create Chroma collection '" + name + "': " + resp.code() +
-                        " " + (resp.body() != null ? resp.body().string() : ""));
+        String jsonBody = mapper.writeValueAsString(createBody);
+
+        String id = withRetry("Chroma create collection '" + name + "'", () -> {
+            Request post = new Request.Builder()
+                    .url(url)
+                    .post(RequestBody.create(jsonBody, MediaType.get("application/json")))
+                    .build();
+            try (Response resp = httpChroma.newCall(post).execute()) {
+                if (!resp.isSuccessful() || resp.body() == null) {
+                    throw new HttpStatusException(resp.code(), "Could not create Chroma collection '" + name + "': " +
+                            resp.code() + " " + (resp.body() != null ? resp.body().string() : ""));
+                }
+                Map<String, Object> m = mapper.readValue(resp.body().string(), new TypeReference<Map<String, Object>>() {});
+                return String.valueOf(m.get("id"));
             }
-            Map<String, Object> m = mapper.readValue(resp.body().string(), new TypeReference<Map<String, Object>>() {});
-            String id = String.valueOf(m.get("id"));
-            collectionIds.put(name, id);
-            return id;
-        }
+        });
+        collectionIds.put(name, id);
+        return id;
     }
 
     private void chromaUpsert(String collectionName, List<String> ids, List<float[]> embeddings,
@@ -631,17 +870,22 @@ public class Engine implements AutoCloseable {
         body.put("embeddings", embList);
         body.put("documents", documents);
         body.put("metadatas", metadatas);
+        String jsonBody = mapper.writeValueAsString(body);
+        String url = collectionsBaseUrl() + "/" + id + "/upsert";
 
-        Request req = new Request.Builder()
-                .url(collectionsBaseUrl() + "/" + id + "/upsert")
-                .post(RequestBody.create(mapper.writeValueAsString(body), MediaType.get("application/json")))
-                .build();
-        try (Response resp = http.newCall(req).execute()) {
-            if (!resp.isSuccessful()) {
-                throw new IOException("Chroma upsert failed: " + resp.code() + " " +
-                        (resp.body() != null ? resp.body().string() : ""));
+        withRetry("Chroma upsert(" + collectionName + ")", () -> {
+            Request req = new Request.Builder()
+                    .url(url)
+                    .post(RequestBody.create(jsonBody, MediaType.get("application/json")))
+                    .build();
+            try (Response resp = httpChroma.newCall(req).execute()) {
+                if (!resp.isSuccessful()) {
+                    throw new HttpStatusException(resp.code(), "Chroma upsert failed: " + resp.code() + " " +
+                            (resp.body() != null ? resp.body().string() : ""));
+                }
+                return null;
             }
-        }
+        });
     }
 
     @SuppressWarnings("unchecked")
@@ -655,31 +899,99 @@ public class Engine implements AutoCloseable {
             body.put("query_embeddings", Collections.singletonList(qe));
             body.put("n_results", nResults);
             body.put("include", Arrays.asList("documents", "metadatas", "distances"));
+            String jsonBody = mapper.writeValueAsString(body);
+            String url = collectionsBaseUrl() + "/" + id + "/query";
 
-            Request req = new Request.Builder()
-                    .url(collectionsBaseUrl() + "/" + id + "/query")
-                    .post(RequestBody.create(mapper.writeValueAsString(body), MediaType.get("application/json")))
-                    .build();
-            try (Response resp = http.newCall(req).execute()) {
-                if (!resp.isSuccessful() || resp.body() == null) {
-                    return QueryResult.empty();
+            return withRetry("Chroma query(" + collectionName + ")", () -> {
+                Request req = new Request.Builder()
+                        .url(url)
+                        .post(RequestBody.create(jsonBody, MediaType.get("application/json")))
+                        .build();
+                try (Response resp = httpChroma.newCall(req).execute()) {
+                    if (!resp.isSuccessful() || resp.body() == null) {
+                        throw new HttpStatusException(resp.code(), "Chroma query failed: " + resp.code());
+                    }
+                    Map<String, Object> m = mapper.readValue(resp.body().string(), new TypeReference<Map<String, Object>>() {});
+                    List<List<String>> idsN = (List<List<String>>) m.getOrDefault("ids", Collections.emptyList());
+                    List<List<String>> docsN = (List<List<String>>) m.getOrDefault("documents", Collections.emptyList());
+                    List<List<Map<String, Object>>> metasN = (List<List<Map<String, Object>>>) m.getOrDefault("metadatas", Collections.emptyList());
+                    List<List<Double>> distsN = (List<List<Double>>) m.getOrDefault("distances", Collections.emptyList());
+
+                    return new QueryResult(
+                            idsN.isEmpty() ? Collections.emptyList() : idsN.get(0),
+                            docsN.isEmpty() ? Collections.emptyList() : docsN.get(0),
+                            metasN.isEmpty() ? Collections.emptyList() : metasN.get(0),
+                            distsN.isEmpty() ? Collections.emptyList() : distsN.get(0));
                 }
-                Map<String, Object> m = mapper.readValue(resp.body().string(), new TypeReference<Map<String, Object>>() {});
-                List<List<String>> idsN = (List<List<String>>) m.getOrDefault("ids", Collections.emptyList());
-                List<List<String>> docsN = (List<List<String>>) m.getOrDefault("documents", Collections.emptyList());
-                List<List<Map<String, Object>>> metasN = (List<List<Map<String, Object>>>) m.getOrDefault("metadatas", Collections.emptyList());
-                List<List<Double>> distsN = (List<List<Double>>) m.getOrDefault("distances", Collections.emptyList());
-
-                return new QueryResult(
-                        idsN.isEmpty() ? Collections.emptyList() : idsN.get(0),
-                        docsN.isEmpty() ? Collections.emptyList() : docsN.get(0),
-                        metasN.isEmpty() ? Collections.emptyList() : metasN.get(0),
-                        distsN.isEmpty() ? Collections.emptyList() : distsN.get(0));
-            }
+            });
         } catch (IOException e) {
-            log("Chroma query failed for collection '" + collectionName + "': " + e.getMessage());
+            log("Chroma query failed for collection '" + collectionName + "' after retries: " + e.getMessage());
             return QueryResult.empty();
         }
+    }
+
+    /** Low-level call to ChromaDB's /get endpoint, with pagination (limit/offset). */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> chromaGet(String collectionName, Map<String, Object> whereFilter, int limit, int offset) throws IOException {
+        String id = collectionId(collectionName);
+        String url = collectionsBaseUrl() + "/" + id + "/get";
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        if (whereFilter != null && !whereFilter.isEmpty()) body.put("where", whereFilter);
+        body.put("limit", limit);
+        body.put("offset", offset);
+        body.put("include", Arrays.asList("documents", "metadatas"));
+        String jsonBody = mapper.writeValueAsString(body);
+
+        return withRetry("Chroma get(" + collectionName + ")", () -> {
+            Request req = new Request.Builder()
+                    .url(url)
+                    .post(RequestBody.create(jsonBody, MediaType.get("application/json")))
+                    .build();
+            try (Response resp = httpChroma.newCall(req).execute()) {
+                if (!resp.isSuccessful() || resp.body() == null) {
+                    throw new HttpStatusException(resp.code(), "Chroma get failed: " + resp.code());
+                }
+                Map<String, Object> m = mapper.readValue(resp.body().string(), new TypeReference<Map<String, Object>>() {});
+
+                List<String> ids2 = m.get("ids") instanceof List ? (List<String>) m.get("ids") : Collections.emptyList();
+                List<String> docs = m.get("documents") instanceof List ? (List<String>) m.get("documents") : Collections.emptyList();
+                List<Map<String, Object>> metas = m.get("metadatas") instanceof List ? (List<Map<String, Object>>) m.get("metadatas") : Collections.emptyList();
+
+                List<Map<String, Object>> items = new ArrayList<>();
+                for (int i = 0; i < docs.size(); i++) {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("id", i < ids2.size() ? ids2.get(i) : null);
+                    item.put("document", docs.get(i));
+                    item.put("metadata", i < metas.size() ? metas.get(i) : Collections.emptyMap());
+                    items.add(item);
+                }
+                return items;
+            }
+        });
+    }
+
+    /** Used by the "clean up stale rules" menu action and the delete-by-number pair actions. */
+    private void chromaDelete(String collectionName, List<String> ids) throws IOException {
+        if (ids.isEmpty()) return;
+        String id = collectionId(collectionName);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("ids", ids);
+        String jsonBody = mapper.writeValueAsString(body);
+        String url = collectionsBaseUrl() + "/" + id + "/delete";
+
+        withRetry("Chroma delete(" + collectionName + ")", () -> {
+            Request req = new Request.Builder()
+                    .url(url)
+                    .post(RequestBody.create(jsonBody, MediaType.get("application/json")))
+                    .build();
+            try (Response resp = httpChroma.newCall(req).execute()) {
+                if (!resp.isSuccessful()) {
+                    throw new HttpStatusException(resp.code(), "Chroma delete failed: " + resp.code());
+                }
+                return null;
+            }
+        });
     }
 
     private QueryResult retrieveSimilar(String collectionName, String prompt, int topK, boolean dedup) throws Exception {
@@ -698,6 +1010,12 @@ public class Engine implements AutoCloseable {
         return l.size() <= topK ? l : new ArrayList<>(l.subList(0, topK));
     }
 
+    /**
+     * Deduplicates by code_regle, keeping the first (nearest) occurrence of each code.
+     * Excel rows have real, distinct codes, so this correctly collapses duplicate hits
+     * on the same rule. Human-approved examples each get a unique generated code_regle
+     * (see learnFromApproval), so this no longer discards every approved example but one.
+     */
     private QueryResult dedupe(QueryResult r, int topK) {
         Set<String> seen = new HashSet<>();
         List<String> docs = new ArrayList<>();
@@ -716,11 +1034,84 @@ public class Engine implements AutoCloseable {
         return new QueryResult(Collections.emptyList(), docs, metas, dists);
     }
 
+    // ======================================================================
+    // Retry / backoff utility
+    // ======================================================================
+
+    /** Thrown for non-2xx HTTP responses so withRetry can decide, from the status code, whether to retry. */
+    private static class HttpStatusException extends IOException {
+        final int code;
+        HttpStatusException(int code, String message) {
+            super(message);
+            this.code = code;
+        }
+    }
+
+    @FunctionalInterface
+    private interface HttpCall<T> {
+        T call() throws IOException;
+    }
+
+    /**
+     * Runs an HTTP call with exponential backoff + jitter. Retries transient network errors and
+     * HTTP 429/5xx responses; does not retry other 4xx responses (bad request, auth, not found, etc.)
+     * since retrying those just wastes time and hides real bugs.
+     */
+    private <T> T withRetry(String opName, HttpCall<T> call) throws IOException {
+        int maxAttempts = Math.max(1, config.getRetryMaxAttempts());
+        long baseDelay = config.getRetryBaseDelayMs();
+        IOException lastError = null;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return call.call();
+            } catch (IOException e) {
+                lastError = e;
+                boolean retryable = isRetryable(e);
+                if (attempt == maxAttempts || !retryable) {
+                    throw e;
+                }
+                long delay = backoffDelay(baseDelay, attempt);
+                log(opName + ": attempt " + attempt + "/" + maxAttempts + " failed (" + e.getMessage() +
+                        ") - retrying in " + delay + " ms.");
+                sleepQuietly(delay);
+            }
+        }
+        // Unreachable in practice (loop always returns or throws), but keeps the compiler happy.
+        throw lastError != null ? lastError : new IOException(opName + " failed for an unknown reason.");
+    }
+
+    private boolean isRetryable(IOException e) {
+        if (e instanceof HttpStatusException) {
+            int code = ((HttpStatusException) e).code;
+            return code == 429 || code >= 500;
+        }
+        // Connection resets, timeouts, DNS hiccups, "connection refused" while Chroma restarts, etc.
+        return true;
+    }
+
+    private long backoffDelay(long baseDelay, int attempt) {
+        long exp = baseDelay * (1L << Math.min(attempt - 1, 10)); // avoid overflow on high attempt counts
+        long capped = Math.min(exp, 10_000L);
+        long jitter = ThreadLocalRandom.current().nextLong(0, capped / 4 + 1);
+        return capped + jitter;
+    }
+
+    private void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     @Override
     public void close() throws Exception {
         if (predictor != null) predictor.close();
-        http.dispatcher().executorService().shutdown();
-        http.connectionPool().evictAll();
+        httpChroma.dispatcher().executorService().shutdown();
+        httpChroma.connectionPool().evictAll();
+        httpGemini.dispatcher().executorService().shutdown();
+        httpGemini.connectionPool().evictAll();
         log("Engine closed.");
     }
 
@@ -740,16 +1131,22 @@ public class Engine implements AutoCloseable {
     public static class GenerationResult {
         public final String userPrompt;
         public final String generatedCode;
+        /** Metadata of the similar (positive) reference rules retrieved for this generation. */
         public final List<Map<String, Object>> retrievedContext;
+        /** Metadata of the closest rejected counter-example considered (may be empty). */
+        public final List<Map<String, Object>> retrievedRejected;
         public final String systemInstruction;
         public final String fullPromptSent;
         public final double latencySec;
 
-        public GenerationResult(String userPrompt, String generatedCode, List<Map<String, Object>> retrievedContext,
+        public GenerationResult(String userPrompt, String generatedCode,
+                                List<Map<String, Object>> retrievedContext,
+                                List<Map<String, Object>> retrievedRejected,
                                 String systemInstruction, String fullPromptSent, double latencySec) {
             this.userPrompt = userPrompt;
             this.generatedCode = generatedCode;
             this.retrievedContext = retrievedContext;
+            this.retrievedRejected = retrievedRejected;
             this.systemInstruction = systemInstruction;
             this.fullPromptSent = fullPromptSent;
             this.latencySec = latencySec;
