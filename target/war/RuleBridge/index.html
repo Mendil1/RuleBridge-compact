@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="Utf-8">
+    <title>RuleBridge AI</title>
+    <style>
+        body { font-family: sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; }
+        textarea, input[type="password"], input[type="text"], input[type="file"] { width: 100%; padding: 10px; font-size: 16px; margin-bottom: 15px; box-sizing: border-box; }
+        textarea { height: 100px; }
+        pre { background: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; min-height: 200px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #0056b3; color: white; border: none; border-radius: 4px; margin-right: 10px; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .section { background: #e9ecef; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .status { color: green; font-weight: bold; margin-top: 10px; }
+        .error { color: red; font-weight: bold; margin-top: 10px; }
+        .file-item { margin: 5px 0; padding: 10px; background: #fff; border: 1px solid #ccc; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+        .btn-del { background: #dc3545; padding: 5px 10px; font-size: 12px; }
+    </style>
+</head>
+<body>
+<h1>RuleBridge DSL Generator</h1>
+
+<div class="section">
+    <h3>1. Configuration</h3>
+    <label>ID Employé :</label>
+    <input type="text" id="empId" placeholder="ex: emp123">
+    <label>Clé API Gemini :</label>
+    <input type="password" id="apiKey" placeholder="Votre clé API">
+
+    <label>Source des données :</label><br>
+    <input type="radio" name="dataSource" id="useDefault" value="default" checked> <label for="useDefault">Règles globales entreprise</label><br>
+    <input type="radio" name="dataSource" id="useCustom" value="custom"> <label for="useCustom">Mes fichiers personnalisés</label><br><br>
+
+    <button onclick="initWorkspace()">Initialiser l'espace</button>
+    <div id="initStatus"></div>
+</div>
+
+<div id="workspace" style="display:none;">
+    <div class="section">
+        <h3>📁 Mes Fichiers (Base de connaissances)</h3>
+        <div id="fileList">Chargement...</div>
+        <hr>
+        <h4>Ajouter un nouveau fichier</h4>
+        <label>Nom du fichier :</label>
+        <input type="text" id="newFileName" placeholder="ex: Règles Crédit Q3">
+        <label>Fichier EXPRESSIONS :</label>
+        <input type="file" id="exprFile" accept=".xlsx">
+        <label>Fichier CONTROLERROR (Optionnel) :</label>
+        <input type="file" id="ctrlFile" accept=".xlsx">
+        <button onclick="uploadFile()">Uploader & Indexer</button>
+        <div id="uploadStatus"></div>
+    </div>
+
+    <div class="section">
+        <h3>⚡ Génération de Règle</h3>
+        <label>Exigence métier (Français) :</label>
+        <textarea id="prompt" placeholder="Entrez l'exigence métier..."></textarea>
+        <button onclick="generate()">Générer la Règle</button>
+        <h2>Code Java/DSL:</h2>
+        <pre id="result">En attente...</pre>
+    </div>
+</div>
+
+<script>
+    let mainCollection = null, rejectedCollection = null;
+
+    window.onload = function() {
+        document.getElementById('apiKey').value = localStorage.getItem('gemini_api_key') || '';
+        document.getElementById('empId').value = localStorage.getItem('employee_id') || '';
+    };
+
+    async function initWorkspace() {
+        const empId = document.getElementById('empId').value.trim();
+        const apiKey = document.getElementById('apiKey').value.trim();
+        const dataSource = document.querySelector('input[name="dataSource"]:checked').value;
+
+        if (!empId || !apiKey) { alert("Veuillez remplir ID et Clé API."); return; }
+        localStorage.setItem('employee_id', empId);
+        localStorage.setItem('gemini_api_key', apiKey);
+
+        if (dataSource === 'custom') {
+            mainCollection = "rules_" + empId;
+            rejectedCollection = "rejected_" + empId;
+            document.getElementById('workspace').style.display = 'block';
+            loadFiles();
+        } else {
+            mainCollection = null; rejectedCollection = null;
+            document.getElementById('workspace').style.display = 'block';
+            document.getElementById('fileList').innerHTML = "<em>Mode Global: Utilisation de la base maître.</em>";
+            document.querySelector('h3').innerText = "⚡ Génération de Règle (Global)";
+        }
+    }
+
+    async function loadFiles() {
+        const empId = document.getElementById('empId').value.trim();
+        try {
+            const res = await fetch(`/RuleBridge/files?empId=${encodeURIComponent(empId)}`);
+            const files = await res.json();
+            renderFiles(files);
+        } catch(e) { console.error(e); }
+    }
+
+    function renderFiles(files) {
+        const listDiv = document.getElementById('fileList');
+        if(!files || files.length === 0) { listDiv.innerHTML = "<em>Aucun fichier uploadé.</em>"; return; }
+        let html = '<label><input type="checkbox" id="selectAll" onchange="toggleAll(this)" checked> <strong>Tout sélectionner</strong></label><br>';
+        files.forEach(f => {
+            const date = new Date(f.date).toLocaleDateString();
+            html += `<div class="file-item">
+                    <label><input type="checkbox" class="fileCheck" value="${f.id}" checked>
+                    <strong>${f.name}</strong> <small>(${f.rules} règles, ${date})</small></label>
+                    <button class="btn-del" onclick="deleteFile('${f.id}')">Supprimer</button>
+                </div>`;
+        });
+        listDiv.innerHTML = html;
+    }
+
+    function toggleAll(source) { document.querySelectorAll('.fileCheck').forEach(cb => cb.checked = source.checked); }
+
+    async function deleteFile(fileId) {
+        if(!confirm("Supprimer ce fichier et toutes ses règles ?")) return;
+        const empId = document.getElementById('empId').value.trim();
+        const formData = new URLSearchParams();
+        formData.append('empId', empId); formData.append('action', 'delete'); formData.append('fileId', fileId);
+        await fetch('/RuleBridge/files', { method: 'POST', body: formData });
+        loadFiles();
+    }
+
+    async function uploadFile() {
+        const empId = document.getElementById('empId').value.trim();
+        const fileName = document.getElementById('newFileName').value.trim();
+        const exprFile = document.getElementById('exprFile').files[0];
+        const ctrlFile = document.getElementById('ctrlFile').files[0];
+        const status = document.getElementById('uploadStatus');
+
+        if (!exprFile) { status.innerHTML = "<span class='error'>Fichier Expressions requis.</span>"; return; }
+        status.innerHTML = "<span>Traitement et indexation en cours...</span>";
+
+        const formData = new FormData();
+        formData.append('empId', empId); formData.append('fileName', fileName);
+        formData.append('exprFile', exprFile);
+        if (ctrlFile) formData.append('ctrlFile', ctrlFile);
+
+        try {
+            const res = await fetch('/RuleBridge/upload', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (data.success) { status.innerHTML = "<span class='status'>Succès!</span>"; loadFiles(); }
+            else { status.innerHTML = "<span class='error'>" + data.error + "</span>"; }
+        } catch (e) { status.innerHTML = "<span class='error'>Erreur réseau</span>"; }
+    }
+
+    async function generate() {
+        const apiKey = document.getElementById('apiKey').value;
+        const prompt = document.getElementById('prompt').value;
+        const dataSource = document.querySelector('input[name="dataSource"]:checked').value;
+
+        const selected = Array.from(document.querySelectorAll('.fileCheck:checked')).map(cb => cb.value);
+        if (dataSource === 'custom' && selected.length === 0) {
+            document.getElementById('result').innerText = "Erreur: Sélectionnez au moins un fichier."; return;
+        }
+
+        document.getElementById('result').innerText = "Chargement...";
+        const formData = new URLSearchParams();
+        formData.append('prompt', prompt); formData.append('apiKey', apiKey);
+        if (mainCollection) formData.append('mainCollection', mainCollection);
+        if (rejectedCollection) formData.append('rejectedCollection', rejectedCollection);
+        formData.append('selectedFiles', selected.length > 0 ? selected.join(',') : 'all');
+
+        try {
+            const res = await fetch('/RuleBridge/generate', { method: 'POST', body: formData });
+            const data = await res.json();
+            document.getElementById('result').innerText = data.error ? "Erreur: " + data.error : data.generatedCode;
+        } catch (e) { document.getElementById('result').innerText = "Erreur réseau: " + e; }
+    }
+</script>
+</body>
+</html>

@@ -251,15 +251,23 @@ public class Engine implements AutoCloseable {
     // Ingestion: Excel -> embeddings -> Chroma (incremental, fault-tolerant)
     // ======================================================================
     public void ingest() throws Exception {
-        log("Reading Excel: " + config.getExcelFilePath());
-        List<Rule> rules = parseExcel(config.getExcelFilePath());
+        ingest(config.getExcelFilePath(), config.getChromaCollection());
+    }
+
+    public int ingest(String excelFilePath, String collectionName) throws Exception {
+        return ingest(excelFilePath, collectionName, "legacy_cli", "Legacy CLI Upload");
+    }
+
+    public int ingest(String excelFilePath, String collectionName, String fileId, String fileName) throws Exception {
+        log("Reading Excel: " + excelFilePath + " (File ID: " + fileId + ")");
+        List<Rule> rules = parseExcel(excelFilePath);
         if (rules.isEmpty()) {
             log("No rules found - aborting ingestion.");
-            return;
+            return 0;
         }
         log("Parsed " + rules.size() + " rules from Excel. Checking against ChromaDB for changes...");
 
-        Map<String, String> existingHashes = fetchExistingHashes(config.getChromaCollection());
+        Map<String, String> existingHashes = fetchExistingHashes(collectionName);
         log("ChromaDB currently holds " + existingHashes.size() + " previously-indexed Excel rule(s).");
 
         List<Rule> toProcess = new ArrayList<>();
@@ -281,7 +289,7 @@ public class Engine implements AutoCloseable {
 
         if (toProcess.isEmpty()) {
             log("Nothing to embed - ChromaDB is already up to date with the Excel file.");
-            return;
+            return rules.size();
         }
 
         int batchSize = config.getEmbeddingBatchSize();
@@ -310,12 +318,14 @@ public class Engine implements AutoCloseable {
                 meta.put("libelle_champ", n(r.libelleChamp));
                 meta.put("expression_java", n(r.expressionJava));
                 meta.put("source", "excel");
+                meta.put("file_id", fileId);
+                meta.put("file_name", fileName);
                 meta.put("content_hash", computeContentHash(r));
                 metas.add(meta);
             }
 
             try {
-                chromaUpsert(config.getChromaCollection(), ids, embeddings, docs, metas);
+                chromaUpsert(collectionName, ids, embeddings, docs, metas);
                 log("Batch " + batchNum + "/" + totalBatches + " indexed (rows " + i + "-" + (end - 1) + ").");
             } catch (IOException e) {
                 failedBatches++;
@@ -330,6 +340,7 @@ public class Engine implements AutoCloseable {
         } else {
             log("Ingestion finished with " + failedBatches + "/" + totalBatches + " batch(es) failed - re-run to retry them.");
         }
+        return rules.size();
     }
 
     /** Reads existing content_hash metadata for every Excel-sourced row currently in Chroma. */
@@ -388,18 +399,54 @@ public class Engine implements AutoCloseable {
         Files.deleteIfExists(Paths.get(System.getProperty("user.home"), ".rulebridge", "stale_rule_ids.txt"));
     }
 
+    public void deleteByFileId(String collectionName, String fileId) throws IOException {
+        Map<String, Object> whereFilter = Collections.singletonMap("file_id", fileId);
+        chromaDeleteWhere(collectionName, whereFilter);
+        log("Deleted all rules for file_id=" + fileId + " from " + collectionName);
+    }
+
+    private void chromaDeleteWhere(String collectionName, Map<String, Object> whereFilter) throws IOException {
+        String id = collectionId(collectionName);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("where", whereFilter);
+        String jsonBody = mapper.writeValueAsString(body);
+        String url = collectionsBaseUrl() + "/" + id + "/delete";
+
+        withRetry("Chroma deleteWhere(" + collectionName + ")", () -> {
+            Request req = new Request.Builder()
+                    .url(url)
+                    .post(RequestBody.create(jsonBody, MediaType.get("application/json")))
+                    .build();
+            try (Response resp = httpChroma.newCall(req).execute()) {
+                if (!resp.isSuccessful()) throw new HttpStatusException(resp.code(), "Chroma deleteWhere failed");
+                return null;
+            }
+        });
+    }
+
     // ======================================================================
     // RAG generation
     // ======================================================================
+    // 1. Simple CLI overload (Fixes the Main.java error)
     public GenerationResult generate(String userPrompt, int topK) throws Exception {
+        return generate(userPrompt, topK, null, config.getChromaCollection(), config.getRejectedCollection(), null);
+    }
+
+    // 2. Web overload without filter
+    public GenerationResult generate(String userPrompt, int topK, String userApiKey, String collectionName, String rejectedCollectionName) throws Exception {
+        return generate(userPrompt, topK, userApiKey, collectionName, rejectedCollectionName, null);
+    }
+
+    // 3. Main Web implementation WITH filter
+    public GenerationResult generate(String userPrompt, int topK, String userApiKey, String collectionName, String rejectedCollectionName, Map<String, Object> whereFilter) throws Exception {
         log("REQUEST (generate) user='" + config.getUserId() + "' prompt=\"" + userPrompt + "\"");
         long t0 = System.currentTimeMillis();
-        QueryResult similar = retrieveSimilar(config.getChromaCollection(), userPrompt, topK, config.isDeduplicate());
-        QueryResult rejected = retrieveSimilar(config.getRejectedCollection(), userPrompt, 1, false);
+        QueryResult similar = retrieveSimilar(collectionName, userPrompt, topK, config.isDeduplicate(), whereFilter);
+        QueryResult rejected = retrieveSimilar(rejectedCollectionName, userPrompt, 1, false, null);
 
         String system = buildSystemInstruction();
         String fewShot = buildFewShotPrompt(userPrompt, similar, rejected);
-        String code = callGemini(system, fewShot);
+        String code = callGemini(system, fewShot, userApiKey);
 
         double latency = (System.currentTimeMillis() - t0) / 1000.0;
         log("RESPONSE (generate): " + code);
@@ -726,9 +773,15 @@ public class Engine implements AutoCloseable {
     // ======================================================================
     @SuppressWarnings("unchecked")
     private String callGemini(String systemInstruction, String userPrompt) throws IOException {
-        String apiKey = config.getGeminiApiKey();
+        return callGemini(systemInstruction, userPrompt, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private String callGemini(String systemInstruction, String userPrompt, String userApiKey) throws IOException {
+        // Prioritize the user's provided key over the server config key
+        String apiKey = (userApiKey != null && !userApiKey.trim().isEmpty()) ? userApiKey.trim() : config.getGeminiApiKey();
         if (apiKey == null || apiKey.trim().isEmpty()) {
-            return "// GEMINI_API_KEY not configured.";
+            return "// Erreur: Aucune clé API Gemini fournie. Veuillez entrer votre clé.";
         }
         String model = config.getGeminiModel();
         String url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
@@ -791,6 +844,8 @@ public class Engine implements AutoCloseable {
         }
         return text.trim();
     }
+
+    
 
     // ======================================================================
     // Chroma REST client (v2 API - tenant/database scoped, matches current
@@ -889,7 +944,7 @@ public class Engine implements AutoCloseable {
     }
 
     @SuppressWarnings("unchecked")
-    private QueryResult chromaQuery(String collectionName, float[] queryEmbedding, int nResults) {
+    private QueryResult chromaQuery(String collectionName, float[] queryEmbedding, int nResults, Map<String, Object> whereFilter) {
         try {
             String id = collectionId(collectionName);
             List<Float> qe = new ArrayList<>(queryEmbedding.length);
@@ -899,6 +954,9 @@ public class Engine implements AutoCloseable {
             body.put("query_embeddings", Collections.singletonList(qe));
             body.put("n_results", nResults);
             body.put("include", Arrays.asList("documents", "metadatas", "distances"));
+            if (whereFilter != null && !whereFilter.isEmpty()) {
+                body.put("where", whereFilter);
+            }
             String jsonBody = mapper.writeValueAsString(body);
             String url = collectionsBaseUrl() + "/" + id + "/query";
 
@@ -994,10 +1052,10 @@ public class Engine implements AutoCloseable {
         });
     }
 
-    private QueryResult retrieveSimilar(String collectionName, String prompt, int topK, boolean dedup) throws Exception {
+    private QueryResult retrieveSimilar(String collectionName, String prompt, int topK, boolean dedup, Map<String, Object> whereFilter) throws Exception {
         float[] qe = embed(prompt);
         int fetchLimit = dedup ? topK * 5 : topK;
-        QueryResult r = chromaQuery(collectionName, qe, fetchLimit);
+        QueryResult r = chromaQuery(collectionName, qe, fetchLimit, whereFilter);
         return dedup && !r.metadatas.isEmpty() ? dedupe(r, topK) : limit(r, topK);
     }
 

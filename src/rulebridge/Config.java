@@ -197,8 +197,7 @@ public class Config {
         if (envKey == null || envKey.trim().isEmpty()) {
             throw new IllegalStateException("GEMINI_API_KEY environment variable MUST be set in WildFly.");
         }
-        c.geminiApiKey = validateKey(envKey);
-        c.userId = "wildfly-server";
+        c.geminiApiKey = (envKey != null && !envKey.trim().isEmpty()) ? validateKey(envKey) : null;        c.userId = "wildfly-server";
         return c;
     }
 
