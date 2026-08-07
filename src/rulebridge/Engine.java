@@ -340,6 +340,7 @@ public class Engine implements AutoCloseable {
         } else {
             log("Ingestion finished with " + failedBatches + "/" + totalBatches + " batch(es) failed - re-run to retry them.");
         }
+        ingestToGlobalMaster(rules);
         return rules.size();
     }
 
@@ -425,23 +426,184 @@ public class Engine implements AutoCloseable {
     }
 
     // ======================================================================
+    // Global Master Brain (Company-wide deduplication)
+    // ======================================================================
+    private void ingestToGlobalMaster(List<Rule> rules) throws Exception {
+        String globalCollection = "global_master_rules";
+        log("Checking " + rules.size() + " rules against Global Master Brain...");
+        
+        Map<String, Rule> hashToRule = new LinkedHashMap<>();
+        for (Rule r : rules) {
+            String hash = computeContentHash(r);
+            hashToRule.put(hash, r);
+        }
+        
+        List<String> allHashes = new ArrayList<>(hashToRule.keySet());
+        Set<String> existingHashes = new HashSet<>();
+        int batchSize = 500; 
+        
+        for (int i = 0; i < allHashes.size(); i += batchSize) {
+            List<String> batchIds = allHashes.subList(i, Math.min(i + batchSize, allHashes.size()));
+            try {
+                List<Map<String, Object>> existingItems = chromaGetByIds(globalCollection, batchIds);
+                for (Map<String, Object> item : existingItems) {
+                    existingHashes.add(String.valueOf(item.get("id")));
+                }
+            } catch (Exception e) {
+                log("Warning: Could not check global DB for batch " + i + ": " + e.getMessage());
+            }
+        }
+        
+        List<Rule> newRules = new ArrayList<>();
+        for (String hash : allHashes) {
+            if (!existingHashes.contains(hash)) {
+                newRules.add(hashToRule.get(hash));
+            }
+        }
+        
+        if (newRules.isEmpty()) {
+            log("All rules already exist in Global Master Brain. Skipped.");
+            return;
+        }
+        
+        log("Found " + newRules.size() + " NEW unique rules to add to Global Master Brain.");
+        
+        int embedBatchSize = config.getEmbeddingBatchSize();
+        for (int i = 0; i < newRules.size(); i += embedBatchSize) {
+            List<Rule> batch = newRules.subList(i, Math.min(i + embedBatchSize, newRules.size()));
+            List<String> ids = new ArrayList<>();
+            List<String> docs = new ArrayList<>();
+            List<float[]> embeddings = new ArrayList<>();
+            List<Map<String, Object>> metas = new ArrayList<>();
+            
+            for (Rule r : batch) {
+                String hash = computeContentHash(r);
+                ids.add(hash); 
+                String text = prepareEmbeddingText(r);
+                docs.add(text);
+                embeddings.add(embed(text));
+                
+                Map<String, Object> meta = new LinkedHashMap<>();
+                meta.put("code_regle", n(r.codeRegle));
+                meta.put("category", n(r.categorieRegle));
+                meta.put("nom_champ", n(r.nomChamp));
+                meta.put("libelle_champ", n(r.libelleChamp));
+                meta.put("expression_java", n(r.expressionJava));
+                meta.put("source", "global_master");
+                meta.put("content_hash", hash);
+                metas.add(meta);
+            }
+            
+            chromaUpsert(globalCollection, ids, embeddings, docs, metas);
+        }
+        log("Global Master Brain updated with " + newRules.size() + " new rules.");
+    }
+
+    private List<Map<String, Object>> chromaGetByIds(String collectionName, List<String> ids) throws IOException {
+        if (ids.isEmpty()) return Collections.emptyList();
+        String colId = collectionId(collectionName);
+        String url = collectionsBaseUrl() + "/" + colId + "/get";
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("ids", ids);
+        body.put("include", Arrays.asList("metadatas"));
+        String jsonBody = mapper.writeValueAsString(body);
+
+        return withRetry("Chroma getByIds(" + collectionName + ")", () -> {
+            Request req = new Request.Builder()
+                    .url(url)
+                    .post(RequestBody.create(jsonBody, MediaType.get("application/json")))
+                    .build();
+            try (Response resp = httpChroma.newCall(req).execute()) {
+                if (!resp.isSuccessful() || resp.body() == null) {
+                    if (resp.code() == 404 || resp.code() == 500) return Collections.emptyList();
+                    throw new HttpStatusException(resp.code(), "Chroma getByIds failed: " + resp.code());
+                }
+                Map<String, Object> m = mapper.readValue(resp.body().string(), new TypeReference<Map<String, Object>>() {});
+                List<String> returnedIds = m.get("ids") instanceof List ? (List<String>) m.get("ids") : Collections.emptyList();
+                
+                List<Map<String, Object>> items = new ArrayList<>();
+                for (String id : returnedIds) {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("id", id);
+                    items.add(item);
+                }
+                return items;
+            }
+        });
+    }
+
+    private QueryResult mergeAndSortResults(QueryResult r1, QueryResult r2, int topK, boolean dedup) {
+        if (r1 == null) r1 = QueryResult.empty();
+        if (r2 == null) r2 = QueryResult.empty();
+
+        List<String> allIds = new ArrayList<>(r1.ids != null ? r1.ids : Collections.emptyList());
+        if (r2.ids != null) allIds.addAll(r2.ids);
+
+        List<String> allDocs = new ArrayList<>(r1.documents != null ? r1.documents : Collections.emptyList());
+        if (r2.documents != null) allDocs.addAll(r2.documents);
+
+        List<Map<String, Object>> allMetas = new ArrayList<>(r1.metadatas != null ? r1.metadatas : Collections.emptyList());
+        if (r2.metadatas != null) allMetas.addAll(r2.metadatas);
+
+        List<Double> allDists = new ArrayList<>(r1.distances != null ? r1.distances : Collections.emptyList());
+        if (r2.distances != null) allDists.addAll(r2.distances);
+        // Safeguard: Ensure we only iterate up to the size of the smallest list to prevent IndexOutOfBounds
+        int validCount = Math.min(Math.min(allIds.size(), allDocs.size()), Math.min(allMetas.size(), allDists.size()));
+        
+        Integer[] indices = new Integer[validCount];
+        for (int i = 0; i < validCount; i++) indices[i] = i;
+        
+        Arrays.sort(indices, (a, b) -> {
+            Double dA = allDists.get(a) != null ? allDists.get(a) : Double.MAX_VALUE;
+            Double dB = allDists.get(b) != null ? allDists.get(b) : Double.MAX_VALUE;
+            return Double.compare(dA, dB);
+        });
+        
+        List<String> sIds = new ArrayList<>();
+        List<String> sDocs = new ArrayList<>();
+        List<Map<String, Object>> sMetas = new ArrayList<>();
+        List<Double> sDists = new ArrayList<>();
+        
+        for (int idx : indices) {
+            sIds.add(allIds.get(idx));
+            sDocs.add(allDocs.get(idx));
+            sMetas.add(allMetas.get(idx));
+            sDists.add(allDists.get(idx));
+        }
+        
+        QueryResult merged = new QueryResult(sIds, sDocs, sMetas, sDists);
+        return dedup && !merged.metadatas.isEmpty() ? dedupe(merged, topK) : limit(merged, topK);
+    }
+
+    // ======================================================================
     // RAG generation
     // ======================================================================
     // 1. Simple CLI overload (Fixes the Main.java error)
     public GenerationResult generate(String userPrompt, int topK) throws Exception {
-        return generate(userPrompt, topK, null, config.getChromaCollection(), config.getRejectedCollection(), null);
+        return generate(userPrompt, topK, null, config.getChromaCollection(), config.getRejectedCollection(), null, false);
     }
 
     // 2. Web overload without filter
     public GenerationResult generate(String userPrompt, int topK, String userApiKey, String collectionName, String rejectedCollectionName) throws Exception {
-        return generate(userPrompt, topK, userApiKey, collectionName, rejectedCollectionName, null);
+        return generate(userPrompt, topK, userApiKey, collectionName, rejectedCollectionName, null, false);
     }
 
     // 3. Main Web implementation WITH filter
     public GenerationResult generate(String userPrompt, int topK, String userApiKey, String collectionName, String rejectedCollectionName, Map<String, Object> whereFilter) throws Exception {
+        return generate(userPrompt, topK, userApiKey, collectionName, rejectedCollectionName, whereFilter, false);
+    }
+
+    public GenerationResult generate(String userPrompt, int topK, String userApiKey, String collectionName, String rejectedCollectionName, Map<String, Object> whereFilter, boolean includeGlobal) throws Exception {
         log("REQUEST (generate) user='" + config.getUserId() + "' prompt=\"" + userPrompt + "\"");
         long t0 = System.currentTimeMillis();
         QueryResult similar = retrieveSimilar(collectionName, userPrompt, topK, config.isDeduplicate(), whereFilter);
+        
+        if (includeGlobal) {
+            QueryResult globalSimilar = retrieveSimilar("global_master_rules", userPrompt, topK, config.isDeduplicate(), null);
+            similar = mergeAndSortResults(similar, globalSimilar, topK, config.isDeduplicate());
+        }
+        
         QueryResult rejected = retrieveSimilar(rejectedCollectionName, userPrompt, 1, false, null);
 
         String system = buildSystemInstruction();
@@ -451,6 +613,23 @@ public class Engine implements AutoCloseable {
         double latency = (System.currentTimeMillis() - t0) / 1000.0;
         log("RESPONSE (generate): " + code);
         return new GenerationResult(userPrompt, code, similar.metadatas, rejected.metadatas, system, fewShot, latency);
+    }
+
+    public GenerationResult revise(String userPrompt, String previousCode, String userFeedback, String userApiKey) throws Exception {
+        log("REQUEST (revise) user='" + config.getUserId() + "' feedback=\"" + userFeedback + "\"");
+        long t0 = System.currentTimeMillis();
+        String system = buildSystemInstruction();
+        StringBuilder sb = new StringBuilder();
+        sb.append("### EXIGENCE MÉTIER ORIGINALE :\n").append(userPrompt).append("\n\n");
+        sb.append("### EXPRESSION PRÉCÉDEMMENT GÉNÉRÉE :\n").append(previousCode).append("\n\n");
+        sb.append("### DEMANDE DE CORRECTION DE L'UTILISATEUR :\n").append(userFeedback).append("\n\n");
+        sb.append("Régénère l'expression Java/DSL corrigée en respectant strictement cette demande. ")
+                .append("Réponds uniquement avec l'expression, sans aucun commentaire ni bloc Markdown.");
+        String fewShot = sb.toString();
+        String code = callGemini(system, fewShot, userApiKey);
+        double latency = (System.currentTimeMillis() - t0) / 1000.0;
+        log("RESPONSE (revise): " + code);
+        return new GenerationResult(userPrompt, code, java.util.Collections.emptyList(), java.util.Collections.emptyList(), system, fewShot, latency);
     }
 
     /** Conversational revision: "add a null check", "change date format", etc. Produces new DSL code. */
@@ -478,6 +657,25 @@ public class Engine implements AutoCloseable {
      * qaHistory accumulates (question, answer) pairs for this generation session so follow-up
      * questions keep context; pass an empty list for the first question.
      */
+    public String askAboutGeneration(GenerationResult result, List<String[]> qaHistory, String question, String userApiKey) throws IOException {
+        log("REQUEST (question) user='" + config.getUserId() + "' question=\"" + question + "\"");
+        String system = "Vous êtes un expert développeur Java Senior chez BFI Group qui EXPLIQUE, en français, les choix faits lors de la génération d'une expression Java/DSL. Répondez de façon claire et pédagogique.";
+        StringBuilder sb = new StringBuilder();
+        sb.append("### EXIGENCE MÉTIER :\n").append(result.userPrompt).append("\n\n### EXPRESSION GÉNÉRÉE :\n").append(result.generatedCode).append("\n\n");
+        if (result.retrievedContext != null && !result.retrievedContext.isEmpty()) {
+            sb.append("### EXEMPLES DE RÉFÉRENCE :\n");
+            for (Map<String, Object> meta : result.retrievedContext) sb.append("- ").append(meta.getOrDefault("code_regle", "N/A")).append(" | ").append(meta.getOrDefault("expression_java", "N/A")).append("\n");
+        }
+        if (qaHistory != null && !qaHistory.isEmpty()) {
+            sb.append("\n### ÉCHANGE PRÉCÉDENT :\n");
+            for (String[] qa : qaHistory) sb.append("Q: ").append(qa[0]).append("\nR: ").append(qa[1]).append("\n\n");
+        }
+        sb.append("\n### QUESTION :\n").append(question).append("\n\nRépondez uniquement à cette question, sans régénérer l'expression.");
+        String answer = callGemini(system, sb.toString(), userApiKey);
+        log("RESPONSE (answer): " + answer);
+        return answer;
+    }
+
     public String askAboutGeneration(GenerationResult result, List<String[]> qaHistory, String question) throws IOException {
         log("REQUEST (question) user='" + config.getUserId() + "' question=\"" + question + "\"");
         String system = "Vous êtes un expert développeur Java Senior chez BFI Group qui EXPLIQUE, en français, " +
@@ -524,6 +722,26 @@ public class Engine implements AutoCloseable {
     // ======================================================================
     // Human feedback -> learning
     // ======================================================================
+
+    public void learnFromApproval(String prompt, String approvedCode, String collectionName) throws Exception {
+        String id = "human_" + java.util.UUID.randomUUID();
+        float[] emb = embed(prompt);
+        java.util.Map<String, Object> meta = new java.util.LinkedHashMap<>();
+        meta.put("code_regle", id); meta.put("category", "human_feedback");
+        meta.put("nom_champ", ""); meta.put("libelle_champ", "");
+        meta.put("expression_java", approvedCode); meta.put("source", "human_approved");
+        chromaUpsert(collectionName, java.util.Collections.singletonList(id), java.util.Collections.singletonList(emb), java.util.Collections.singletonList(prompt), java.util.Collections.singletonList(meta));
+        log("Saved approved example to " + collectionName);
+    }
+
+    public void learnFromRejection(String prompt, String rejectedCode, String reason, String rejectedCollectionName) throws Exception {
+        String id = "rejected_" + java.util.UUID.randomUUID();
+        float[] emb = embed(prompt);
+        java.util.Map<String, Object> meta = new java.util.LinkedHashMap<>();
+        meta.put("expression_java", rejectedCode); meta.put("reason", reason == null ? "" : reason); meta.put("source", "human_rejected");
+        chromaUpsert(rejectedCollectionName, java.util.Collections.singletonList(id), java.util.Collections.singletonList(emb), java.util.Collections.singletonList(prompt), java.util.Collections.singletonList(meta));
+        log("Saved rejected example to " + rejectedCollectionName);
+    }
 
     /** Approved (or manually corrected) prompt->code pair: index it so future similar prompts retrieve it. */
     public void learnFromApproval(String prompt, String approvedCode) throws Exception {
@@ -593,6 +811,39 @@ public class Engine implements AutoCloseable {
             this.reason = reason != null ? reason : "";
         }
     }
+
+    public java.util.List<Pair> getApprovedPairs(String collectionName) throws IOException {
+        java.util.Map<String, Object> filter = java.util.Collections.singletonMap("source", "human_approved");
+        java.util.List<java.util.Map<String, Object>> items = chromaGet(collectionName, filter, 200, 0);
+        java.util.List<Pair> pairs = new java.util.ArrayList<>();
+        for (java.util.Map<String, Object> item : items) {
+            String id = item.get("id") != null ? String.valueOf(item.get("id")) : null;
+            String prompt = (String) item.get("document");
+            @SuppressWarnings("unchecked") java.util.Map<String, Object> meta = (java.util.Map<String, Object>) item.get("metadata");
+            String code = meta != null && meta.get("expression_java") != null ? String.valueOf(meta.get("expression_java")) : "";
+            pairs.add(new Pair(id, prompt, code, null));
+        }
+        return pairs;
+    }
+
+    public java.util.List<Pair> getRejectedPairs(String rejectedCollectionName) {
+        java.util.List<Pair> pairs = new java.util.ArrayList<>();
+        try {
+            java.util.List<java.util.Map<String, Object>> items = chromaGet(rejectedCollectionName, java.util.Collections.singletonMap("source", "human_rejected"), 500, 0);
+            for (java.util.Map<String, Object> item : items) {
+                String id = item.get("id") != null ? String.valueOf(item.get("id")) : null;
+                String prompt = (String) item.get("document");
+                @SuppressWarnings("unchecked") java.util.Map<String, Object> meta = (java.util.Map<String, Object>) item.get("metadata");
+                String code = meta != null && meta.get("expression_java") != null ? String.valueOf(meta.get("expression_java")) : "";
+                String reason = meta != null && meta.get("reason") != null ? String.valueOf(meta.get("reason")) : "";
+                pairs.add(new Pair(id, prompt, code, reason));
+            }
+        } catch (IOException e) { log("Could not retrieve rejected pairs: " + e.getMessage()); }
+        return pairs;
+    }
+
+    public void deleteApprovedPair(String id, String collectionName) throws IOException { chromaDelete(collectionName, java.util.Collections.singletonList(id)); }
+    public void deleteRejectedPair(String id, String rejectedCollectionName) throws IOException { chromaDelete(rejectedCollectionName, java.util.Collections.singletonList(id)); }
 
     /** Returns all human-approved prompt->code pairs stored in the main Chroma collection. */
     public List<Pair> getApprovedPairs() throws IOException {
@@ -1076,6 +1327,7 @@ public class Engine implements AutoCloseable {
      */
     private QueryResult dedupe(QueryResult r, int topK) {
         Set<String> seen = new HashSet<>();
+        List<String> ids = new ArrayList<>();
         List<String> docs = new ArrayList<>();
         List<Map<String, Object>> metas = new ArrayList<>();
         List<Double> dists = new ArrayList<>();
@@ -1083,13 +1335,14 @@ public class Engine implements AutoCloseable {
             Map<String, Object> meta = r.metadatas.get(i);
             String code = meta != null ? String.valueOf(meta.getOrDefault("code_regle", "UNKNOWN")) : "UNKNOWN";
             if (seen.add(code)) {
+                ids.add(i < r.ids.size() ? r.ids.get(i) : "deduped_" + i);
                 docs.add(r.documents.get(i));
                 metas.add(meta);
                 dists.add(i < r.distances.size() ? r.distances.get(i) : null);
                 if (docs.size() >= topK) break;
             }
         }
-        return new QueryResult(Collections.emptyList(), docs, metas, dists);
+        return new QueryResult(ids, docs, metas, dists);
     }
 
     // ======================================================================

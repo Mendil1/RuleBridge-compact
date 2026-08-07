@@ -74,7 +74,7 @@ try {
     # ---------------------------------------------------------
     # TEST 4: Single Pre-Merged File Upload
     # ---------------------------------------------------------
-    $masterFile = $null
+    $masterFile = Get-ChildItem -Path . -Filter "Master_Rules_Audit_Report.xlsx" -ErrorAction SilentlyContinue
     if ($masterFile) {
         $masterPath = $masterFile.FullName
         $uploadRes2 = curl.exe -s -X POST "$baseUrl/upload" `
