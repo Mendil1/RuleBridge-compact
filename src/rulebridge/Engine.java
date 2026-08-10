@@ -595,6 +595,10 @@ public class Engine implements AutoCloseable {
     }
 
     public GenerationResult generate(String userPrompt, int topK, String userApiKey, String collectionName, String rejectedCollectionName, Map<String, Object> whereFilter, boolean includeGlobal) throws Exception {
+        return generate(userPrompt, topK, userApiKey, collectionName, rejectedCollectionName, whereFilter, includeGlobal, null, null);
+    }
+
+    public GenerationResult generate(String userPrompt, int topK, String userApiKey, String collectionName, String rejectedCollectionName, Map<String, Object> whereFilter, boolean includeGlobal, Double overrideTemp, String overrideModel) throws Exception {
         log("REQUEST (generate) user='" + config.getUserId() + "' prompt=\"" + userPrompt + "\"");
         long t0 = System.currentTimeMillis();
         QueryResult similar = retrieveSimilar(collectionName, userPrompt, topK, config.isDeduplicate(), whereFilter);
@@ -608,7 +612,7 @@ public class Engine implements AutoCloseable {
 
         String system = buildSystemInstruction();
         String fewShot = buildFewShotPrompt(userPrompt, similar, rejected);
-        String code = callGemini(system, fewShot, userApiKey);
+        String code = callGemini(system, fewShot, userApiKey, overrideTemp, overrideModel);
 
         double latency = (System.currentTimeMillis() - t0) / 1000.0;
         log("RESPONSE (generate): " + code);
@@ -1029,12 +1033,17 @@ public class Engine implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     private String callGemini(String systemInstruction, String userPrompt, String userApiKey) throws IOException {
+        return callGemini(systemInstruction, userPrompt, userApiKey, null, null);
+    }
+
+    private String callGemini(String systemInstruction, String userPrompt, String userApiKey, Double overrideTemp, String overrideModel) throws IOException {
         // Prioritize the user's provided key over the server config key
         String apiKey = (userApiKey != null && !userApiKey.trim().isEmpty()) ? userApiKey.trim() : config.getGeminiApiKey();
         if (apiKey == null || apiKey.trim().isEmpty()) {
             return "// Erreur: Aucune clé API Gemini fournie. Veuillez entrer votre clé.";
         }
-        String model = config.getGeminiModel();
+        String model = (overrideModel != null && !overrideModel.trim().isEmpty()) ? overrideModel.trim() : config.getGeminiModel();
+        double temp = (overrideTemp != null) ? overrideTemp : config.getGeminiTemperature();
         String url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
 
         Map<String, Object> systemPart = new LinkedHashMap<>();
@@ -1049,7 +1058,7 @@ public class Engine implements AutoCloseable {
         contentMap.put("parts", Collections.singletonList(userPart));
 
         Map<String, Object> genConfig = new LinkedHashMap<>();
-        genConfig.put("temperature", config.getGeminiTemperature());
+        genConfig.put("temperature", temp);
         genConfig.put("maxOutputTokens", config.getGeminiMaxTokens());
 
         Map<String, Object> requestMap = new LinkedHashMap<>();

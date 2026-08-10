@@ -127,6 +127,9 @@
                     <strong>🧠 Cerveau Global</strong>
                 </label>
             </div>
+            <button class="btn btn-ghost" onclick="openSettings()" style="margin-right:10px;">
+                <i class="fas fa-sliders-h"></i> Paramètres
+            </button>
             <button class="btn btn-ghost" onclick="openAudit()" style="margin-right:10px;">
                 <i class="fas fa-shield-alt"></i> Audit
             </button>
@@ -138,7 +141,10 @@
         <div class="workspace">
             <!-- Prompt Card -->
             <div class="card">
-                <label>Exigence Métier (Français)</label>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <label style="margin:0;">Exigence Métier (Français)</label>
+                    <span id="activeModelBadge" style="background:#e0e7ff; color:#3730a3; padding:5px 12px; border-radius:20px; font-size:11px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; border:1px solid #c7d2fe;"></span>
+                </div>
                 <textarea id="prompt" placeholder="Ex: Vérifier que le montant ne dépasse pas 50k si l'âge < 35 ans..."></textarea>
                 <div style="margin-top:15px; display:flex; justify-content:flex-end;">
                     <button class="btn btn-primary" onclick="generate()">
@@ -151,7 +157,10 @@
             <div class="card" id="resultCard" style="display:none;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
                     <h3 style="margin:0;">Code Java / DSL</h3>
-                    <span id="latencyBadge" style="background:#e0e7ff; color:#3730a3; padding:4px 8px; border-radius:12px; font-size:12px; font-weight:600;"></span>
+                    <div style="display:flex; gap:8px; align-items:center;">
+                        <span id="genMeta" style="background:#f3f4f6; color:var(--text); padding:4px 8px; border-radius:12px; font-size:11px; font-weight:600; border:1px solid var(--border);"></span>
+                        <span id="latencyBadge" style="background:#e0e7ff; color:#3730a3; padding:4px 8px; border-radius:12px; font-size:11px; font-weight:600;"></span>
+                    </div>
                 </div>
                 
                 <div class="code-container">
@@ -218,6 +227,46 @@
     </div>
 
     
+    
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal">
+        <div class="modal-content" style="width: 500px;">
+            <div class="modal-header">
+                <h3 style="margin:0;"><i class="fas fa-sliders-h" style="color:var(--primary);"></i> Paramètres Avancés</h3>
+                <button class="btn btn-ghost btn-sm" onclick="closeSettings()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Température (Créativité vs Déterminisme)</label>
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        <input type="range" id="tempSlider" min="0" max="1" step="0.1" value="0.0" style="flex:1;" oninput="document.getElementById('tempVal').value = this.value">
+                        <input type="number" id="tempVal" min="0" max="1" step="0.1" value="0.0" style="width:60px;" oninput="document.getElementById('tempSlider').value = this.value">
+                    </div>
+                    <small style="color:var(--text-light);">0.0 = Déterministe (recommandé pour le code), 1.0 = Créatif</small>
+                </div>
+                
+                <div class="form-group">
+                    <label>Modèle IA</label>
+                    <select id="modelSelect" onchange="updateModelInfo()">
+                        <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite (Best Overall)</option>
+                        <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite (Failover)</option>
+                        <option value="gemini-3.5-flash">Gemini 3.5 Flash (High Accuracy)</option>
+                        <option value="gemini-3-flash">Gemini 3 Flash (Standard)</option>
+                        <option value="gemma-4-31b-it">Gemma 4 31B (High Volume)</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Top-K (Nombre d'exemples RAG)</label>
+                    <input type="number" id="topKInput" min="1" max="10" value="3">
+                    <small style="color:var(--text-light);">Nombre de règles sources injectées dans le prompt (1 à 10)</small>
+                </div>
+                
+                <button class="btn btn-primary" style="width:100%; margin-top:15px;" onclick="saveSettings()">Sauvegarder</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Audit Modal -->
     <div id="auditModal" class="modal">
         <div class="modal-content" style="width: 900px;">
@@ -241,6 +290,72 @@
     <div id="toastContainer" class="toast-container"></div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js">
+        
+        
+        function updateActiveModelBadge() {
+            const badge = document.getElementById('activeModelBadge');
+            if (badge) {
+                badge.innerText = settings.model;
+                badge.title = `Top-K: ${settings.topK} | Température: ${settings.temperature}`;
+            }
+        }
+
+        // Advanced Settings State
+        
+        const allowedModels = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3-flash', 'gemma-4-31b-it'];
+        let savedSettings = JSON.parse(localStorage.getItem('rb_settings'));
+        
+        // Auto-correct invalid or outdated saved models
+        if (!savedSettings || !allowedModels.includes(savedSettings.model)) {
+            savedSettings = { temperature: 0.0, model: 'gemini-3.5-flash-lite', topK: 3 };
+            localStorage.setItem('rb_settings', JSON.stringify(savedSettings));
+        }
+        let settings = savedSettings;
+
+
+        
+        const modelDetails = {
+            'gemini-3.5-flash-lite': { quota: '15 RPM | 250K TPM | 500 RPD', why: 'Flash Lite models process system instructions and few-shot examples quickly with minimal latency. Given your 500 Requests Per Day limit, this should serve as your main production endpoint for standard rule translation.', best: 'Primary few-shot rule parsing and expression generation.' },
+            'gemini-3.1-flash-lite': { quota: '15 RPM | 250K TPM | 500 RPD', why: 'Identical throughput limits to 3.5 Flash Lite. If you exhaust your 500 daily requests on 3.5 Flash Lite during heavy development, falling back to 3.1 Flash Lite doubles your total daily free capacity to 1,000 requests/day without altering your few-shot prompt format.', best: 'Automatic API failover when 3.5 Flash Lite hits rate limits.' },
+            'gemini-3.5-flash': { quota: '5 RPM | 250K TPM | 20 RPD', why: 'Offers higher reasoning capability for complex, ambiguous, or deeply nested business logic where few-shot context needs strict adherence. While the daily limit is low (20 RPD), it excels at resolving tricky prompts that fail on Flash Lite.', best: 'Routing complex rules, debugging ambiguous input, or running dry-run test cases.' },
+            'gemini-3-flash': { quota: '5 RPM | 250K TPM | 20 RPD', why: 'Offers a balanced middle ground between lightweight performance and full-model reasoning. Useful as a backup tier for handling low-volume, high-precision tasks when Flash Lite options are unavailable.', best: 'Secondary reasoning fallback for complex prompt structures.' },
+            'gemma-4-31b-it': { quota: '30 RPM | 16K TPM | 14.4K RPD', why: 'Gemma 4 31B is listed on your dashboard with an impressive 14,400 Requests Per Day quota. Since it\'s an open-weights model family, you can evaluate it on Google\'s infrastructure via API or even run/fine-tune it locally if offline reliability is needed.', best: 'High-volume batch generation, offline dev environments, or local fine-tuning.' }
+        };
+
+        function updateModelInfo() {
+            const model = document.getElementById('modelSelect').value;
+            const info = modelDetails[model];
+            if (info) {
+                document.getElementById('modelInfoBox').innerHTML = `
+                    <strong style="color: var(--primary);">${model}</strong><br>
+                    <span style="color: var(--success); font-weight: 600;">${info.quota}</span><br>
+                    <span style="color: var(--text-light);">${info.why}</span><br>
+                    <strong style="color: var(--text);">Best for:</strong> ${info.best}
+                `;
+            }
+        }
+
+        function openSettings() {
+            document.getElementById('tempSlider').value = settings.temperature;
+            document.getElementById('tempVal').value = settings.temperature;
+            document.getElementById('modelSelect').value = settings.model;
+            document.getElementById('topKInput').value = settings.topK;
+            document.getElementById('settingsModal').style.display = 'flex';
+            updateModelInfo();
+        }
+
+        function closeSettings() { document.getElementById('settingsModal').style.display = 'none'; }
+
+        function saveSettings() {
+            settings.temperature = parseFloat(document.getElementById('tempVal').value);
+            settings.model = document.getElementById('modelSelect').value;
+            settings.topK = parseInt(document.getElementById('topKInput').value);
+            localStorage.setItem('rb_settings', JSON.stringify(settings));
+            showToast('Paramètres sauvegardés !');
+            updateActiveModelBadge();
+            closeSettings();
+        }
+
         // Audit Trail
         let auditData = [];
         function openAudit() { 
@@ -303,6 +418,72 @@
 
     </script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js">
+        
+        
+        function updateActiveModelBadge() {
+            const badge = document.getElementById('activeModelBadge');
+            if (badge) {
+                badge.innerText = settings.model;
+                badge.title = `Top-K: ${settings.topK} | Température: ${settings.temperature}`;
+            }
+        }
+
+        // Advanced Settings State
+        
+        const allowedModels = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3-flash', 'gemma-4-31b-it'];
+        let savedSettings = JSON.parse(localStorage.getItem('rb_settings'));
+        
+        // Auto-correct invalid or outdated saved models
+        if (!savedSettings || !allowedModels.includes(savedSettings.model)) {
+            savedSettings = { temperature: 0.0, model: 'gemini-3.5-flash-lite', topK: 3 };
+            localStorage.setItem('rb_settings', JSON.stringify(savedSettings));
+        }
+        let settings = savedSettings;
+
+
+        
+        const modelDetails = {
+            'gemini-3.5-flash-lite': { quota: '15 RPM | 250K TPM | 500 RPD', why: 'Flash Lite models process system instructions and few-shot examples quickly with minimal latency. Given your 500 Requests Per Day limit, this should serve as your main production endpoint for standard rule translation.', best: 'Primary few-shot rule parsing and expression generation.' },
+            'gemini-3.1-flash-lite': { quota: '15 RPM | 250K TPM | 500 RPD', why: 'Identical throughput limits to 3.5 Flash Lite. If you exhaust your 500 daily requests on 3.5 Flash Lite during heavy development, falling back to 3.1 Flash Lite doubles your total daily free capacity to 1,000 requests/day without altering your few-shot prompt format.', best: 'Automatic API failover when 3.5 Flash Lite hits rate limits.' },
+            'gemini-3.5-flash': { quota: '5 RPM | 250K TPM | 20 RPD', why: 'Offers higher reasoning capability for complex, ambiguous, or deeply nested business logic where few-shot context needs strict adherence. While the daily limit is low (20 RPD), it excels at resolving tricky prompts that fail on Flash Lite.', best: 'Routing complex rules, debugging ambiguous input, or running dry-run test cases.' },
+            'gemini-3-flash': { quota: '5 RPM | 250K TPM | 20 RPD', why: 'Offers a balanced middle ground between lightweight performance and full-model reasoning. Useful as a backup tier for handling low-volume, high-precision tasks when Flash Lite options are unavailable.', best: 'Secondary reasoning fallback for complex prompt structures.' },
+            'gemma-4-31b-it': { quota: '30 RPM | 16K TPM | 14.4K RPD', why: 'Gemma 4 31B is listed on your dashboard with an impressive 14,400 Requests Per Day quota. Since it\'s an open-weights model family, you can evaluate it on Google\'s infrastructure via API or even run/fine-tune it locally if offline reliability is needed.', best: 'High-volume batch generation, offline dev environments, or local fine-tuning.' }
+        };
+
+        function updateModelInfo() {
+            const model = document.getElementById('modelSelect').value;
+            const info = modelDetails[model];
+            if (info) {
+                document.getElementById('modelInfoBox').innerHTML = `
+                    <strong style="color: var(--primary);">${model}</strong><br>
+                    <span style="color: var(--success); font-weight: 600;">${info.quota}</span><br>
+                    <span style="color: var(--text-light);">${info.why}</span><br>
+                    <strong style="color: var(--text);">Best for:</strong> ${info.best}
+                `;
+            }
+        }
+
+        function openSettings() {
+            document.getElementById('tempSlider').value = settings.temperature;
+            document.getElementById('tempVal').value = settings.temperature;
+            document.getElementById('modelSelect').value = settings.model;
+            document.getElementById('topKInput').value = settings.topK;
+            document.getElementById('settingsModal').style.display = 'flex';
+            updateModelInfo();
+        }
+
+        function closeSettings() { document.getElementById('settingsModal').style.display = 'none'; }
+
+        function saveSettings() {
+            settings.temperature = parseFloat(document.getElementById('tempVal').value);
+            settings.model = document.getElementById('modelSelect').value;
+            settings.topK = parseInt(document.getElementById('topKInput').value);
+            localStorage.setItem('rb_settings', JSON.stringify(settings));
+            showToast('Paramètres sauvegardés !');
+            updateActiveModelBadge();
+            closeSettings();
+        }
+
         // Audit Trail
         let auditData = [];
         function openAudit() { 
@@ -384,6 +565,7 @@
         }
 
         window.onload = () => {
+            updateActiveModelBadge();
             document.getElementById('empId').value = state.empId;
             document.getElementById('apiKey').value = state.apiKey;
             loadFiles();
@@ -487,6 +669,9 @@
             formData.append('mainCollection', state.mainCollection);
             formData.append('rejectedCollection', state.rejectedCollection);
             formData.append('includeGlobal', includeGlobal);
+            formData.append('temperature', settings.temperature);
+            formData.append('model', settings.model);
+            formData.append('topK', settings.topK);
             if(selected.length > 0) formData.append('selectedFiles', selected.join(','));
 
             document.getElementById('resultCard').style.display = 'block';
@@ -508,6 +693,7 @@
                 
                 renderCode(data.generatedCode);
                 document.getElementById('latencyBadge').innerText = `${data.latencySec.toFixed(2)}s`;
+                document.getElementById('genMeta').innerText = `${settings.model} | Top-K: ${settings.topK} | Temp: ${settings.temperature}`;
                 document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth' });
             } catch(e) { showToast('Erreur serveur', 'error'); }
         }
@@ -710,6 +896,72 @@
             loadPairs(type);
         }
     
+        
+        
+        function updateActiveModelBadge() {
+            const badge = document.getElementById('activeModelBadge');
+            if (badge) {
+                badge.innerText = settings.model;
+                badge.title = `Top-K: ${settings.topK} | Température: ${settings.temperature}`;
+            }
+        }
+
+        // Advanced Settings State
+        
+        const allowedModels = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3-flash', 'gemma-4-31b-it'];
+        let savedSettings = JSON.parse(localStorage.getItem('rb_settings'));
+        
+        // Auto-correct invalid or outdated saved models
+        if (!savedSettings || !allowedModels.includes(savedSettings.model)) {
+            savedSettings = { temperature: 0.0, model: 'gemini-3.5-flash-lite', topK: 3 };
+            localStorage.setItem('rb_settings', JSON.stringify(savedSettings));
+        }
+        let settings = savedSettings;
+
+
+        
+        const modelDetails = {
+            'gemini-3.5-flash-lite': { quota: '15 RPM | 250K TPM | 500 RPD', why: 'Flash Lite models process system instructions and few-shot examples quickly with minimal latency. Given your 500 Requests Per Day limit, this should serve as your main production endpoint for standard rule translation.', best: 'Primary few-shot rule parsing and expression generation.' },
+            'gemini-3.1-flash-lite': { quota: '15 RPM | 250K TPM | 500 RPD', why: 'Identical throughput limits to 3.5 Flash Lite. If you exhaust your 500 daily requests on 3.5 Flash Lite during heavy development, falling back to 3.1 Flash Lite doubles your total daily free capacity to 1,000 requests/day without altering your few-shot prompt format.', best: 'Automatic API failover when 3.5 Flash Lite hits rate limits.' },
+            'gemini-3.5-flash': { quota: '5 RPM | 250K TPM | 20 RPD', why: 'Offers higher reasoning capability for complex, ambiguous, or deeply nested business logic where few-shot context needs strict adherence. While the daily limit is low (20 RPD), it excels at resolving tricky prompts that fail on Flash Lite.', best: 'Routing complex rules, debugging ambiguous input, or running dry-run test cases.' },
+            'gemini-3-flash': { quota: '5 RPM | 250K TPM | 20 RPD', why: 'Offers a balanced middle ground between lightweight performance and full-model reasoning. Useful as a backup tier for handling low-volume, high-precision tasks when Flash Lite options are unavailable.', best: 'Secondary reasoning fallback for complex prompt structures.' },
+            'gemma-4-31b-it': { quota: '30 RPM | 16K TPM | 14.4K RPD', why: 'Gemma 4 31B is listed on your dashboard with an impressive 14,400 Requests Per Day quota. Since it\'s an open-weights model family, you can evaluate it on Google\'s infrastructure via API or even run/fine-tune it locally if offline reliability is needed.', best: 'High-volume batch generation, offline dev environments, or local fine-tuning.' }
+        };
+
+        function updateModelInfo() {
+            const model = document.getElementById('modelSelect').value;
+            const info = modelDetails[model];
+            if (info) {
+                document.getElementById('modelInfoBox').innerHTML = `
+                    <strong style="color: var(--primary);">${model}</strong><br>
+                    <span style="color: var(--success); font-weight: 600;">${info.quota}</span><br>
+                    <span style="color: var(--text-light);">${info.why}</span><br>
+                    <strong style="color: var(--text);">Best for:</strong> ${info.best}
+                `;
+            }
+        }
+
+        function openSettings() {
+            document.getElementById('tempSlider').value = settings.temperature;
+            document.getElementById('tempVal').value = settings.temperature;
+            document.getElementById('modelSelect').value = settings.model;
+            document.getElementById('topKInput').value = settings.topK;
+            document.getElementById('settingsModal').style.display = 'flex';
+            updateModelInfo();
+        }
+
+        function closeSettings() { document.getElementById('settingsModal').style.display = 'none'; }
+
+        function saveSettings() {
+            settings.temperature = parseFloat(document.getElementById('tempVal').value);
+            settings.model = document.getElementById('modelSelect').value;
+            settings.topK = parseInt(document.getElementById('topKInput').value);
+            localStorage.setItem('rb_settings', JSON.stringify(settings));
+            showToast('Paramètres sauvegardés !');
+            updateActiveModelBadge();
+            closeSettings();
+        }
+
         // Audit Trail
         let auditData = [];
         function openAudit() { 

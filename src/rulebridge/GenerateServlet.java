@@ -25,6 +25,21 @@ public class GenerateServlet extends HttpServlet {
         String rejectedCollection = req.getParameter("rejectedCollection");
         String selectedFilesParam = req.getParameter("selectedFiles");
         boolean includeGlobal = "true".equalsIgnoreCase(req.getParameter("includeGlobal"));
+        
+        // Advanced Parameters (Override server defaults if provided by UI)
+        int topK = EngineLoader.CONFIG.getDefaultTopK();
+        String topKParam = req.getParameter("topK");
+        if (topKParam != null && !topKParam.trim().isEmpty()) {
+            try { topK = Integer.parseInt(topKParam); } catch (NumberFormatException e) { /* ignore */ }
+        }
+        
+        Double temperature = null;
+        String tempParam = req.getParameter("temperature");
+        if (tempParam != null && !tempParam.trim().isEmpty()) {
+            try { temperature = Double.parseDouble(tempParam); } catch (NumberFormatException e) { /* ignore */ }
+        }
+        
+        String model = req.getParameter("model");
 
         if (prompt == null || prompt.trim().isEmpty()) { resp.setStatus(400); return; }
         if (mainCollection == null || mainCollection.trim().isEmpty()) mainCollection = EngineLoader.CONFIG.getChromaCollection();
@@ -40,7 +55,7 @@ public class GenerateServlet extends HttpServlet {
         }
 
         try {
-            Engine.GenerationResult result = EngineLoader.ENGINE.generate(prompt, EngineLoader.CONFIG.getDefaultTopK(), userApiKey, mainCollection, rejectedCollection, whereFilter, includeGlobal);
+            Engine.GenerationResult result = EngineLoader.ENGINE.generate(prompt, topK, userApiKey, mainCollection, rejectedCollection, whereFilter, includeGlobal, temperature, model);
             if (result.generatedCode.startsWith("// Erreur:") || result.generatedCode.startsWith("// GEMINI_API_KEY")) {
                 resp.setStatus(401); Map<String, String> err = new HashMap<>(); err.put("error", "Veuillez entrer votre clé API Gemini.");
                 new ObjectMapper().writeValue(resp.getOutputStream(), err); return;
@@ -50,7 +65,9 @@ public class GenerateServlet extends HttpServlet {
             jsonResponse.put("latencySec", result.latencySec);
             jsonResponse.put("retrievedContext", result.retrievedContext);
             jsonResponse.put("retrievedRejected", result.retrievedRejected);
-            AuditLogger.log(empId, "GENERATE", prompt, result.generatedCode, "Latency: " + result.latencySec + "s");
+            String logTemp = (temperature != null) ? String.valueOf(temperature) : "Default";
+            String logModel = (model != null) ? model : "Default";
+            AuditLogger.log(empId, "GENERATE", prompt, result.generatedCode, "Model: " + logModel + " | TopK: " + topK + " | Temp: " + logTemp + " | Latency: " + result.latencySec + "s");
             new ObjectMapper().writeValue(resp.getOutputStream(), jsonResponse);
         } catch (Exception e) {
             resp.setStatus(500); Map<String, String> err = new HashMap<>(); err.put("error", e.getMessage() != null ? e.getMessage() : "Unknown error");
