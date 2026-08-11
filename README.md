@@ -1093,22 +1093,4 @@ Print this and check off each item during deployment:
 - [ ] Runbook handed over to operations team
 ```
 
----
 
-**How to copy this if the copy button is blocked:**
-
-1. Click anywhere inside the code block above
-2. Press `Ctrl + A` (Windows) or `Cmd + A` (Mac) to select all text inside the block
-3. Press `Ctrl + C` (Windows) or `Cmd + C` (Mac) to copy
-4. Paste into your `README.md` file with `Ctrl + V` / `Cmd + V`
-
-**If that still doesn't work, use this manual method:**
-
-Open the raw file directly on GitHub by clicking the "Raw" button on your README, select all, delete the existing content, then:
-- Right-click inside the code block above
-- Choose "Select All" from the context menu
-- Right-click again and choose "Copy"
-- Paste into the raw GitHub editor
-- Commit changes
-
-Everything above is self-contained and includes all 15 sections: System Overview, Architecture, Hardware Requirements, Windows Deployment, Linux Deployment, Configuration Reference, Starting Instructions, Verification Checklist, Production Hardening, Backup & Recovery, Monitoring & Logs, API Reference, Troubleshooting, FAQ, and the Deployment Checklist.
