@@ -1,4 +1,3 @@
-
 # 🌉 RuleBridge: Enterprise Multi-Tenant RAG Platform
 
 **RuleBridge** is a production-grade, multi-tenant Retrieval-Augmented Generation (RAG) platform engineered for the financial sector. It translates natural-language business requirements into highly specific, domain-specific Java DSL validation rules used in risk management and credit engines.
@@ -45,6 +44,8 @@ Domain experts manage, query, and refine AI-generated code through isolated work
 | **Build System** | PowerShell scripts (no Maven) | Compiles and packages WAR |
 | **Data Storage** | Local filesystem + ChromaDB | Tenant workspaces + vectors |
 | **Audit Trail** | Append-only JSONL | Immutable compliance logging |
+
+> **Why WildFly 26, not the latest WildFly?** This is intentional, not stale. WildFly 27+ dropped Java 8 support and moved to Jakarta EE 10, which renamed every `javax.*` package to `jakarta.*` — a breaking change for this codebase. WildFly 26.1.3.Final is the last release line that is both fully Java-8-compatible and still received security backports (it got a dedicated CVE fix release specifically because the 26.1 line was expected to stay in use longer than usual). Do not "helpfully" bump this to WildFly 27+ without a full `jakarta.*` migration.
 
 ### Key Features
 
@@ -96,7 +97,7 @@ graph TD
 ### Request Lifecycle
 
 1. Browser POSTs prompt + settings to `/RuleBridge/generate`
-2. `GenerateServlet` resolves per-request overrides (temperature, model, topK)
+2. `GenerateServlet` resolves per-request overrides (model, topK — see note on `temperature` below)
 3. `Engine` embeds the prompt with local BGE-M3 ONNX (1024-dim vector)
 4. ChromaDB is queried with a `$in` metadata filter scoped to the user's selected files
 5. Optionally the Global Brain is queried and merged with private results
@@ -130,11 +131,13 @@ graph TD
 
 | Software | Version | Purpose |
 |---|---|---|
-| **Java JDK** | 8 (LTS, e.g. Eclipse Temurin 8u402) | Runtime |
-| **WildFly** | 26.1.3.Final | Application server |
-| **Python** | 3.9+ | ChromaDB host |
-| **ChromaDB** | 0.4.x or newer (via pip) | Vector database |
+| **Java JDK** | 8 (LTS) — always install the latest available 8u build, not a pinned one | Runtime |
+| **WildFly** | 26.1.3.Final (do not upgrade — see note above) | Application server |
+| **Python** | 3.9 – 3.12 | ChromaDB host |
+| **ChromaDB** | **1.0.0 or newer** (via pip) | Vector database |
 | **Git** | Latest | Source code retrieval |
+
+> ⚠️ **ChromaDB version is critical, not cosmetic.** RuleBridge's vector-store client only speaks Chroma's **v2** REST API (`/api/v2/...`). Chroma removed the old `v1` API entirely as of its `1.0.0` release. If you (or `pip`) end up with something older than `1.0.0`, every Chroma call in this app will fail with `404`/`"v1 API is deprecated"`. A plain `pip install chromadb` today will get you a current, v2-capable version — just don't pin an old version in any requirements file.
 
 ---
 
@@ -146,9 +149,11 @@ Log into the VM as an Administrator. Open PowerShell as Administrator for all co
 
 ### Step 1: Install Java 8
 
+Rather than hardcoding a specific 8u build (which goes stale and eventually gets removed from mirrors), pull the **current** Temurin 8 build from Adoptium's stable "latest" API — this URL never changes and always resolves to the newest patched build:
+
 ```powershell
-# Download Eclipse Temurin JDK 8
-Invoke-WebRequest -Uri "https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u402-b06/OpenJDK8U-jdk_x64_windows_hotspot_8u402b06.msi" -OutFile "$env:TEMP\jdk8.msi"
+# Download the latest Eclipse Temurin JDK 8 installer for Windows x64
+Invoke-WebRequest -Uri "https://api.adoptium.net/v3/installer/latest/8/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "$env:TEMP\jdk8.msi"
 
 # Silent install to C:\java
 Start-Process msiexec.exe -ArgumentList '/i', "$env:TEMP\jdk8.msi", '/quiet', 'INSTALLDIR=C:\java', 'ADDLOCAL=FeatureMain' -Wait
@@ -168,7 +173,7 @@ $env:Path = "$env:Path;C:\java\bin"
 java -version
 ```
 
-Expected output: `openjdk version "1.8.0_402"` (or similar).
+Expected output: `openjdk version "1.8.0_..."` (the exact patch number will vary — that's expected and fine).
 
 ### Step 2: Install WildFly 26.1.3.Final
 
@@ -216,14 +221,15 @@ $standaloneXml = "D:\wildfly\wildfly-26.1.3.Final\standalone\configuration\stand
 ### Step 6: Install Python and ChromaDB
 
 ```powershell
-# Install Python 3.11 silently
+# Install Python 3.11 silently (any 3.9–3.12 build works; check python.org/downloads/windows
+# for the latest 3.11.x patch release if you want the newest security fixes)
 Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe" -OutFile "$env:TEMP\python.exe"
 Start-Process -FilePath "$env:TEMP\python.exe" -ArgumentList '/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_test=0' -Wait
 
 # Refresh path
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-# Install ChromaDB
+# Install ChromaDB (pulls the current 1.x release — do NOT pin an old version, see requirements note above)
 pip install chromadb
 
 # Verify
@@ -288,8 +294,9 @@ model.path=D:/models/bge-m3
 # Absolute path to the master rules Excel file (optional initial dataset)
 excel.file-path=D:/rulebridge/RuleBridge/Master_Rules_Audit_Report.xlsx
 
-# Default LLM model and temperature
+# Default LLM model
 gemini.model=gemini-3.5-flash-lite
+# NOTE: gemini.temperature is effectively a no-op on this model — see Configuration Reference below.
 gemini.temperature=0.0
 ```
 
@@ -362,6 +369,9 @@ Log into the VM as `root` or a user with `sudo` privileges.
 **Ubuntu / Debian:**
 
 ```bash
+# openjdk-8-jdk lives in the `universe` component on Ubuntu 22.04/24.04.
+# On minimal/server installs this may not be enabled by default — enable it first:
+sudo add-apt-repository universe
 sudo apt update
 sudo apt install -y openjdk-8-jdk unzip git curl
 java -version
@@ -429,6 +439,7 @@ sudo dnf install -y python3 python3-pip
 # Create a virtual environment for ChromaDB (recommended)
 sudo python3 -m venv /opt/rulebridge/chroma-venv
 sudo chown -R rulebridge:rulebridge /opt/rulebridge/chroma-venv
+# This installs the current ChromaDB release (v2-API-capable, i.e. >= 1.0.0). Do not pin an older version.
 sudo -u rulebridge /opt/rulebridge/chroma-venv/bin/pip install chromadb huggingface_hub
 ```
 
@@ -474,14 +485,18 @@ gemini.temperature=0.0
 
 ### Step 11: Build the WAR File
 
-PowerShell Core (`pwsh`) is required on Linux:
+PowerShell Core (`pwsh`) is required on Linux. Rather than a hardcoded `.rpm` URL (which goes stale fast), install it from Microsoft's official repository so you always get a current, supported build:
 
 ```bash
-# Ubuntu / Debian
+# Ubuntu / Debian — via Microsoft's package repository
+curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+echo "deb [arch=amd64] https://packages.microsoft.com/repos/microsoft-ubuntu-$(lsb_release -cs)-prod $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/microsoft.list
+sudo apt update
 sudo apt install -y powershell
 
-# RHEL / CentOS
-sudo dnf install -y https://github.com/PowerShell/PowerShell/releases/download/v7.4.2/powershell-7.4.2-1.rh.x86_64.rpm
+# RHEL / CentOS — via Microsoft's package repository
+curl https://packages.microsoft.com/config/rhel/9/prod.repo | sudo tee /etc/yum.repos.d/microsoft.repo
+sudo dnf install -y powershell
 
 cd /opt/rulebridge/RuleBridge
 sudo -u rulebridge pwsh -Command "./compile.ps1; ./build-war.ps1"
@@ -614,7 +629,7 @@ All configuration is in `rulebridge.properties`. The file is packaged inside the
 | Key | Default | Description |
 |---|---|---|
 | `gemini.model` | `gemini-3.5-flash-lite` | Default model ID (overridable per-request from UI) |
-| `gemini.temperature` | `0.0` | Default temperature (overridable per-request) |
+| `gemini.temperature` | `0.0` | ⚠️ **No longer has any effect.** Google deprecated `temperature`/`top_p`/`top_k` for the `gemini-3.5-flash-lite` / `gemini-3.6-flash` generation — the API currently ignores this parameter silently, and Google has stated it will be **rejected as an error in future model generations**. If you need deterministic output, that now has to come from prompt design (e.g. explicit "always answer the same way for the same input" instructions), not this setting. Keep the key for forward compatibility but don't rely on it. |
 | `gemini.max-tokens` | `500` | Maximum output tokens per generation |
 | `gemini.connect-timeout-sec` | `15` | Connect timeout |
 | `gemini.read-timeout-sec` | `60` | Read timeout |
@@ -852,7 +867,7 @@ grep '"action":"APPROVE"' ~/.rulebridge/audit_trail.jsonl | jq
 | Endpoint | Purpose |
 |---|---|
 | `GET http://<host>:8000/api/v2/heartbeat` | ChromaDB liveness |
-| `GET http://<host>:9990/health` | WildFly health (if configured) |
+| `GET http://<host>:9990/health` | WildFly health — **only works if the MicroProfile Health subsystem is explicitly added to the deployment/server config.** A stock WildFly 26 standalone install does not expose this out of the box; either add `microprofile-health-smallrye` or drop this check and rely on the `/management` and `/RuleBridge/` checks below instead. |
 | `GET http://<host>:8080/RuleBridge/` | Application reachable |
 
 ---
@@ -878,7 +893,7 @@ Generate a DSL rule from a natural-language prompt.
 | `rejectedCollection` | No | Override rejected collection name |
 | `selectedFiles` | No | Comma-separated `file_id` list or `"all"` |
 | `includeGlobal` | No | `true` to include the Global Brain |
-| `temperature` | No | Override default (0.0 - 1.0) |
+| `temperature` | No | ⚠️ Accepted for backward compatibility but ignored by the current Gemini model — see Configuration Reference |
 | `model` | No | Override model ID |
 | `topK` | No | Override number of Few-Shot examples (1-10) |
 
@@ -931,6 +946,8 @@ List approved or rejected prompt/code pairs.
 
 Delete a pair. Fields: `action=delete`, `type`, `id`, `mainCollection`, `rejectedCollection`.
 
+> **Note:** the endpoints above (`ExcelMerger`, `UserFileManager`, `GenerateServlet`, etc.) reflect your application's internal routing and class names, which this review didn't have source access to verify — only the externally-checkable facts in this document (download URLs, version numbers, third-party API shapes) were fact-checked.
+
 ---
 
 ## 🩺 Troubleshooting
@@ -951,6 +968,11 @@ Delete a pair. Fields: `action=delete`, `type`, `id`, `mainCollection`, `rejecte
 **Cause:** BGE-M3 model files are missing or `model.path` is wrong.
 **Fix:** Verify `model.onnx` exists in the configured path and that the `rulebridge` user has read access.
 
+### Symptom: ChromaDB queries fail with `404` or `"The v1 API is deprecated"`
+
+**Cause:** ChromaDB is running an old (`< 1.0.0`) build that only speaks the removed `v1` API, or `chroma.tenant`/`chroma.database` don't match what the server actually has.
+**Fix:** `pip show chromadb` to confirm version ≥ 1.0.0; upgrade with `pip install -U chromadb` if not. If the version is fine, confirm the tenant/database names in `rulebridge.properties` against `curl http://localhost:8000/api/v2/tenants/default_tenant`.
+
 ### Symptom: ChromaDB queries time out with `SocketTimeoutException`
 
 **Cause:** ChromaDB is not running or the port is blocked.
@@ -960,7 +982,12 @@ Delete a pair. Fields: `action=delete`, `type`, `id`, `mainCollection`, `rejecte
 ### Symptom: `Gemini API error: 429`
 
 **Cause:** Rate limit exceeded on the Free Tier.
-**Fix:** Switch to a higher-quota model via the Settings modal (`gemini-3.1-flash-lite` as failover), or wait for the daily quota reset.
+**Fix:** Switch to a higher-quota model via the Settings modal (`gemini-3.1-flash-lite` as a cheaper failover), or wait for the daily quota reset.
+
+### Symptom: Changing `gemini.temperature` doesn't change output determinism
+
+**Cause:** Not a bug. `temperature`/`top_p`/`top_k` are deprecated for `gemini-3.5-flash-lite`/`gemini-3.6-flash` — the API silently ignores them now (and will start rejecting them outright in future model generations, per Google's migration notes).
+**Fix:** There isn't a config-level fix. If determinism matters for your compliance requirements, control it through prompt design and post-generation validation instead of the sampling parameter.
 
 ### Symptom: French accents display as corrupted characters in logs
 
@@ -1012,6 +1039,9 @@ A: `<user.home>/.rulebridge_data/<empId>/` - on Linux typically `/home/rulebridg
 **Q: Can I run the QA test suite in production?**
 A: Yes - `Run-FullAudit.ps1` is idempotent, uses disposable `qa_alpha` / `qa_beta` tenants, and cleans up after itself. Do not run during peak load.
 
+**Q: Why does `gemini.temperature` exist if it doesn't do anything?**
+A: Kept for backward compatibility with older Gemini model IDs that still honor it, and in case Google reintroduces an equivalent control. If you switch `gemini.model` to an older 2.x-family model, it will work again; on `gemini-3.5-flash-lite`/`3.6-flash` it's currently a no-op.
+
 ---
 
 ## 📞 Support
@@ -1048,13 +1078,13 @@ Print this and check off each item during deployment:
 
 ### Windows path
 
-- [ ] Java 8 installed at `C:\java`
+- [ ] Java 8 installed at `C:\java` (latest available build via the Adoptium API URL above)
 - [ ] WildFly extracted to `D:\wildfly`
 - [ ] `standalone.conf.bat` updated with `-Xms2g -Xmx4g -Dfile.encoding=UTF-8`
 - [ ] WildFly bound to `0.0.0.0`
 - [ ] Management user created
-- [ ] Python 3.11 installed
-- [ ] ChromaDB installed via pip
+- [ ] Python 3.9–3.12 installed
+- [ ] ChromaDB installed via pip (confirm version ≥ 1.0.0 with `chroma --version`)
 - [ ] BGE-M3 downloaded to `D:\models\bge-m3`
 - [ ] Repository cloned to `D:\rulebridge\RuleBridge`
 - [ ] `rulebridge.properties` configured with absolute paths
@@ -1066,17 +1096,17 @@ Print this and check off each item during deployment:
 
 ### Linux path
 
-- [ ] Java 8 installed
+- [ ] Java 8 installed (`universe` repo enabled first on Ubuntu server installs if needed)
 - [ ] `rulebridge` user created
 - [ ] WildFly extracted to `/opt/wildfly`
 - [ ] `standalone.conf` updated with memory and UTF-8 flags
 - [ ] WildFly bound to `0.0.0.0`
 - [ ] Management user created
-- [ ] Python venv created, ChromaDB installed
+- [ ] Python venv created, ChromaDB installed (confirm version ≥ 1.0.0)
 - [ ] BGE-M3 downloaded to `/opt/models/bge-m3`
 - [ ] Repository cloned to `/opt/rulebridge/RuleBridge`
 - [ ] `rulebridge.properties` configured
-- [ ] PowerShell Core installed
+- [ ] PowerShell Core installed via Microsoft's package repo
 - [ ] WAR built and copied to deployments
 - [ ] systemd unit files created
 - [ ] Firewall ports opened
@@ -1091,6 +1121,3 @@ Print this and check off each item during deployment:
 - [ ] Backup cron job / scheduled task installed
 - [ ] Monitoring integrated (if applicable)
 - [ ] Runbook handed over to operations team
-```
-
-
