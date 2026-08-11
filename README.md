@@ -445,15 +445,16 @@ sudo -u rulebridge /opt/rulebridge/chroma-venv/bin/pip install chromadb huggingf
 
 ### Step 8: Download the BGE-M3 ONNX Model
 
+Download the complete BGE-M3 model files and weights (~2.2GB):
+
 ```bash
-sudo -u rulebridge /opt/rulebridge/chroma-venv/bin/python -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id='BAAI/bge-m3',
-    local_dir='/opt/models/bge-m3',
-    allow_patterns=['*.onnx', '*.json', '*.model', '*.txt']
-)
-"
+# 1. Download full weights and ONNX artifacts recursively
+sudo -u rulebridge /opt/rulebridge/chroma-venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-m3', local_dir='/opt/models/bge-m3', allow_patterns=['**/*.onnx*', '*.json', '*.model', '*.txt'])"
+
+# 2. Copy nested ONNX runtime binaries to the top-level model directory
+sudo cp -r /opt/models/bge-m3/onnx/* /opt/models/bge-m3/
+sudo chown -R rulebridge:rulebridge /opt/models
+
 ```
 
 Verify: `/opt/models/bge-m3/model.onnx` must exist.
