@@ -1,4 +1,4 @@
-```markdown
+
 # 🌉 RuleBridge: Enterprise Multi-Tenant RAG Platform
 
 **RuleBridge** is a production-grade, multi-tenant Retrieval-Augmented Generation (RAG) platform engineered for the financial sector. It translates natural-language business requirements into highly specific, domain-specific Java DSL validation rules used in risk management and credit engines.
