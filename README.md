@@ -483,7 +483,14 @@ excel.file-path=/opt/rulebridge/RuleBridge/Master_Rules_Audit_Report.xlsx
 gemini.model=gemini-3.5-flash-lite
 gemini.temperature=0.0
 ```
-
+> ⚠️ **CRITICAL LINUX GOTCHA: The Master Excel File & Sheet Name**
+> 1. **Cross-Platform Paths:** Ensure `excel.file-path` points to a valid Linux path (e.g., `/opt/rulebridge/Master_Rules_Audit_Report.xlsx`). If you leave the Windows path (`D:/projects/...`), the Engine will crash on startup with an `IllegalStateException`, causing a `NullPointerException` on all future uploads.
+> 2. **The Sheet Name Trap:** The Java `Engine` is hardcoded to look for a specific sheet name inside the Master Excel file (e.g., `Master_4679_Rules`). If you upload a file from Windows where the sheet is named `Sheet1` or `Feuil1`, the ingestion will silently abort (`No rules found - aborting ingestion`). 
+> **Fix:** Before uploading the Master file, rename the sheet using Python:
+> ```bash
+> python3 -c "import openpyxl; wb = openpyxl.load_workbook('Master_Rules_Audit_Report.xlsx'); wb.worksheets[0].title = 'Master_4679_Rules'; wb.save('Master_Rules_Audit_Report.xlsx')"
+> ```
+> 
 ### Step 11: Build the WAR File
 
 PowerShell Core (`pwsh`) is required on Linux. Rather than a hardcoded `.rpm` URL (which goes stale fast), install it from Microsoft's official repository so you always get a current, supported build:
@@ -594,7 +601,29 @@ sudo firewall-cmd --reload
 ```
 
 ---
+---
 
+## 🚨 Critical Linux Deployment Gotchas (The "War Stories")
+
+*Read this section carefully. These are hard-won lessons from production deployment that will save your team days of debugging.*
+
+### 1. The SQLite "Read-Only" Trap (ChromaDB WAL Locks)
+**The Symptom:** ChromaDB starts, but when WildFly tries to ingest rules, the logs spam: `Chroma upsert failed: 500 {"error":"InternalError","message":"Error updating collection: Database error: error returned from database: (code: 8) attempt to write a readonly database"}`.
+**The Cause:** ChromaDB uses SQLite under the hood. SQLite requires write access to the **parent directory** to create temporary Write-Ahead Log (WAL) journal files (e.g., `chroma.sqlite3-wal`). If you run `sudo chown -R rulebridge:rulebridge /opt/rulebridge` while ChromaDB is running, or if the parent folder lacks write permissions, SQLite permanently locks the database in Read-Only mode in its RAM.
+**The Fix:** 
+1. Kill the ChromaDB process (`sudo pkill -9 -f "chroma run"`).
+2. Grant write access to the parent folder: `sudo chmod 777 /opt/rulebridge` and `sudo chmod -R 777 /opt/rulebridge/chroma_data`.
+3. Restart ChromaDB. The Java Engine's built-in retry logic will automatically detect the unlocked database and resume the failed embedding batches.
+
+### 2. The "Ghost Process" Port Bind Trap
+**The Symptom:** WildFly fails to start, and logs show: `Failed to start service org.wildfly.undertow.listener.default: Address already in use /0.0.0.0:8080`.
+**The Cause:** A previous Java process crashed but didn't release the port, or a `systemd` service is auto-restarting a zombie process in the background. Standard `kill` commands sometimes miss these.
+**The Fix:** Use `fuser` to assassinate the exact process holding the port:
+```bash
+sudo fuser -k 8080/tcp
+sudo fuser -k 9990/tcp
+sudo pkill -9 -f java
+```
 ## ⚙️ Configuration Reference
 
 All configuration is in `rulebridge.properties`. The file is packaged inside the WAR under `WEB-INF/classes/` at build time.
@@ -1014,8 +1043,28 @@ Delete a pair. Fields: `action=delete`, `type`, `id`, `mainCollection`, `rejecte
     copytruncate
 }
 ```
+### Symptom: `java.lang.NullPointerException at rulebridge.UploadServlet.doPost`
+**Cause:** The `Engine` failed to initialize on startup (usually due to a missing Excel file or wrong Windows path in `rulebridge.properties`), leaving `EngineLoader.ENGINE` as `null`. When a user uploads a file, the Servlet tries to call `.ingest()` on a null object.
+**Fix:** Check the top of the WildFly logs for `[RuleBridge] FATAL: Failed to start Engine`. Fix the `excel.file-path` in `rulebridge.properties` to point to a valid Linux path, ensure the file exists, and restart WildFly.
+
+### Symptom: `Sheet 'Master_4679_Rules' not found` in WildFly logs
+**Cause:** The Java `Engine` expects a hardcoded sheet name inside the uploaded Excel file. If the file was created on Windows, the sheet might be named `Sheet1`.
+**Fix:** Rename the sheet using Python before uploading (see Step 10 warning), or update the hardcoded sheet name in `Engine.java` and rebuild the WAR.
+
+### Symptom: `Duplicate resource [("deployment" => "RuleBridge.war")]`
+**Cause:** WildFly's deployment scanner cache is corrupted, or a previous deployment failed and left a "ghost" entry in `standalone.xml`.
+**Fix:** Wipe the deployment state and restart:
+```bash
+sudo rm -rf /opt/wildfly/standalone/deployments/*
+sudo rm -rf /opt/wildfly/standalone/tmp/*
+sudo rm -rf /opt/wildfly/standalone/data/*
+sudo cp /opt/rulebridge/RuleBridge/target/RuleBridge.war /opt/wildfly/standalone/deployments/
+sudo systemctl restart wildfly
+---
 
 ---
+
+
 
 ## ❓ FAQ
 
