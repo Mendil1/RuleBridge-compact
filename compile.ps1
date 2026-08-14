@@ -1,16 +1,22 @@
-# Compiles the 3 classes against the jars in .\lib
-# Run once you have populated .\lib (see README.md).
+# Compiles the Java sources against jars in .\lib and servlet-api provided by WildFly
 if (!(Test-Path .\lib)) {
     Write-Host "lib\ folder not found. Populate it first (see README.md)." -ForegroundColor Red
     exit 1
 }
 if (!(Test-Path .\out)) { New-Item -ItemType Directory -Path .\out | Out-Null }
 
-$libs = (Get-ChildItem -Path .\lib -Filter *.jar | ForEach-Object { $_.FullName }) -join ';'
-$sources = (Get-ChildItem -Recurse -Path .\src -Filter *.java | ForEach-Object { $_.FullName })
+$jarFiles = Get-ChildItem -Path .\lib -Filter *.jar | ForEach-Object { $_.FullName }
+$servletApi = "/opt/wildfly/modules/system/layers/base/javax/servlet/api/main/jboss-servlet-api_4.0_spec-2.0.1.Final.jar"
 
-# Added '--release 8' to force Java 8 compatibility
-javac --release 8 -d out -cp $libs $sources
+if (Test-Path $servletApi) {
+    $cp = ($jarFiles + $servletApi) -join [System.IO.Path]::PathSeparator
+} else {
+    $cp = $jarFiles -join [System.IO.Path]::PathSeparator
+}
+
+$sources = Get-ChildItem -Recurse -Path .\src -Filter *.java | ForEach-Object { $_.FullName }
+
+javac -source 1.8 -target 1.8 -d out -cp "$cp" $sources
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Compiled OK -> .\out" -ForegroundColor Green

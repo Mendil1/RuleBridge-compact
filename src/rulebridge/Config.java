@@ -70,7 +70,7 @@ public class Config {
 
         String envKey = System.getenv("GEMINI_API_KEY");
         if (envKey != null && !envKey.trim().isEmpty()) {
-            c.geminiApiKey = validateKey(envKey);
+            c.geminiApiKey = (envKey != null && !envKey.trim().isEmpty()) ? validateKey(envKey) : null;
             System.out.println("Using GEMINI_API_KEY from environment (recommended for production).");
             return c;
         }
@@ -191,15 +191,14 @@ public class Config {
     }
 
     public static Config loadServerConfig() throws IOException {
-        Config c = new Config();
-        c.applySharedOverrides();
-        String envKey = System.getenv("GEMINI_API_KEY");
-        if (envKey == null || envKey.trim().isEmpty()) {
-            throw new IllegalStateException("GEMINI_API_KEY environment variable MUST be set in WildFly.");
-        }
-        c.geminiApiKey = (envKey != null && !envKey.trim().isEmpty()) ? validateKey(envKey) : null;        c.userId = "wildfly-server";
-        return c;
-    }
+    Config c = new Config();
+    c.applySharedOverrides();
+    String envKey = System.getenv("GEMINI_API_KEY");
+    // Allow null/empty envKey so WildFly boots cleanly for per-user request keys
+    c.geminiApiKey = (envKey != null && !envKey.trim().isEmpty()) ? validateKey(envKey) : null;
+    c.userId = "wildfly-server";
+    return c;
+}
 
     // ---- getters ----
     public String getChromaHost() { return chromaHost; }

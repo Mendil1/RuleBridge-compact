@@ -97,7 +97,8 @@ public class UploadServlet extends HttpServlet {
             }
             e.printStackTrace();
             resp.setStatus(500);
-            resp.getWriter().write("{\"error\": \"Erreur de traitement: " + e.getMessage().replace("\"", "'") + "\"}");
+            String safeMsg = e.getMessage() != null ? e.getMessage() : e.toString();
+            resp.getWriter().write("{\"error\": \"Erreur de traitement: " + safeMsg.replace("\"", "'").replace("\n", " ").replace("\r", "") + "\"}");
         } finally {
             Files.deleteIfExists(tempExpr);
             Files.deleteIfExists(tempCtrl);

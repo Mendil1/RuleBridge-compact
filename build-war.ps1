@@ -1,10 +1,8 @@
-# build-war.ps1
 $ErrorActionPreference = "Stop"
-
 $warName = "RuleBridge"
-$buildDir = "target\war\$warName"
-$classesDir = "$buildDir\WEB-INF\classes"
-$libDir = "$buildDir\WEB-INF\lib"
+$buildDir = "target/war/$warName"
+$classesDir = "$buildDir/WEB-INF/classes"
+$libDir = "$buildDir/WEB-INF/lib"
 
 Write-Host "Cleaning previous build..."
 if (Test-Path "target") { Remove-Item -Recurse -Force "target" }
@@ -14,13 +12,30 @@ New-Item -ItemType Directory -Force -Path $classesDir | Out-Null
 New-Item -ItemType Directory -Force -Path $libDir | Out-Null
 
 Write-Host "Copying compiled classes..."
-$compiledClasses = "out"
-if (Test-Path "out\production\RuleBridge") { $compiledClasses = "out\production\RuleBridge" }
-Copy-Item -Path "$compiledClasses\*" -Destination $classesDir -Recurse -Force
+if (Test-Path "out/rulebridge") {
+    Copy-Item -Path "out/rulebridge/*" -Destination $classesDir -Recurse -Force
+} elseif (Test-Path "out") {
+    Copy-Item -Path "out/*" -Destination $classesDir -Recurse -Force
+}
 
-Write-Host "Copying dependencies (Excluding Servlet API)..."
-# CRITICAL: Exclude servlet-api so it doesn't conflict with WildFly's native modules
-Copy-Item -Path "lib\*.jar" -Destination $libDir -Force -Exclude "*servlet-api*", "*javax.servlet*"
+Write-Host "Copying dependencies..."
+Copy-Item -Path "lib/*.jar" -Destination $libDir -Force
+
+Write-Host "Aggressively removing Servlet API to prevent WildFly classloader conflicts..."
+Remove-Item -Path "$libDir/*servlet*" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "$libDir/*javax*" -Force -ErrorAction SilentlyContinue
+
+Write-Host "Generating web.xml to force annotation scanning..."
+$webXmlContent = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="http://xmlns.jcp.org/xml/ns/javaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://xmlns.jcp.org/xml/ns/javaee http://xmlns.jcp.org/xml/ns/javaee/web-app_3_1.xsd"
+         version="3.1"
+         metadata-complete="false">
+</web-app>
+"@
+Set-Content -Path "$buildDir/WEB-INF/web.xml" -Value $webXmlContent -Encoding UTF8
 
 Write-Host "Copying configuration and UI..."
 Copy-Item -Path "rulebridge.properties" -Destination $classesDir -Force
@@ -29,13 +44,10 @@ if (Test-Path "index.html") {
 }
 
 Write-Host "Packaging WAR file..."
-$jarExe = "$env:JAVA_HOME\bin\jar.exe"
-if (-Not (Test-Path $jarExe)) { $jarExe = "jar" }
-
 Push-Location $buildDir
-& $jarExe -cvf "..\..\$warName.war" *
+jar -cvf "../../$warName.war" *
 Pop-Location
 
 Write-Host "=============================================="
-Write-Host "Successfully created target\$warName.war"
+Write-Host "Successfully created target/$warName.war"
 Write-Host "=============================================="

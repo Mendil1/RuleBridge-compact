@@ -36,4 +36,5 @@ stale_rule_ids.txt
 # ==========================================
 .DS_Store
 Thumbs.db
-desktop.ini
+desktop.inihs_err_pid*.log
+*.backup
